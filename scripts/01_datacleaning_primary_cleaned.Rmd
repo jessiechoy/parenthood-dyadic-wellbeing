@@ -1,0 +1,1109 @@
+---
+title: "01_datacleaning_primary"
+output: html_document
+---
+
+## Overview
+
+Cleans the raw SOEP files and constructs the primary first-time-parent couple
+sample for the transition-to-parenthood analyses.
+
+Primary design decisions:
+
+- SOEP source coverage is 1984-2024; first births are restricted to 1985-2020.
+- Candidate partners are identified from `pgen$pgpartnr` with `pgpartz` codes
+  1-4, then independently verified against the exact `BIOCOUPLM$partnr`
+  relationship episode and required to be reciprocal.
+- Couples must consist of one male and one female partner (mixed-gender dyads).
+- Prior unions, divorce, or widowhood are not exclusion criteria by themselves.
+- Both partners must report the same first-child birth year. One valid birth-month
+  report is sufficient because it refers to the same shared child; if both report
+  a valid month, the reports must agree.
+- The first-child event is anchored to the survey reporting year. If a respondent
+  was interviewed in the biological birth year, child-birth month is compared
+  with interview month. If there was no interview in that calendar year, the
+  reporting year is set to the following year. Both partners must map the shared
+  first birth to the same reporting year.
+- Primary second-child rule: exclude couples whose first and second biological
+  birth years are consecutive. Also exclude couples where partners report
+  conflicting second-birth years, where at least one partner reports two or more
+  children but neither partner provides a usable second-birth year, or where the
+  recorded second birth precedes the first (data error). Do NOT censor later
+  observations because of a later second child in the primary analysis.
+- Same-year second-child records are retained under the stated consecutive-year
+  rule (e.g., multiple births are not automatically excluded).
+- The exact same cohabiting relationship must cover the full theoretical
+  eight-position window (signals 0-7).
+- As an additional annual co-residence check, whenever both partners have an
+  observed positive PGEN household ID (`hid`) in a signal year, the IDs must
+  agree. A missing household ID alone is not treated as evidence that the
+  couple was not co-residing.
+- A positive annual `pgpartnr` record naming a different partner during the
+  window is treated as a conflict and excluded; a missing annual link alone is
+  not treated as proof that the relationship ended because BIOCOUPLM supplies
+  the longitudinal relationship episode.
+- Life satisfaction is validated to the 0-10 scale; values outside this range
+  are set to missing.
+- Signals 0, 2, and 3 are mandatory. Signal 1 is optional.
+- Each partner must have at least 6 of the 8 life-satisfaction observations.
+- The structurally eligible parent grid is saved before the 6/8 rule is applied,
+  so that the multi-group analysis (script 03) can use the broader parent pool.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(haven)
+library(here)
+
+options(scipen = 999)
+dir.create(here("data", "derived"), recursive = TRUE, showWarnings = FALSE)
+
+FIRST_BIRTH_MIN <- 1985
+FIRST_BIRTH_MAX <- 2020
+PARTNER_STATUS_CODES <- c(1, 2, 3, 4)
+MANDATORY_SIGNALS <- c(0, 2, 3)
+MIN_LS_OBS <- 6
+EXCLUDE_CONFLICTING_PARTNER_LINKS <- TRUE
+EXCLUDE_OBSERVED_HID_MISMATCH <- TRUE
+
+assert_unique <- function(data, keys, object_name) {
+  dup <- data %>%
+    group_by(across(all_of(keys))) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    filter(n > 1)
+
+  if (nrow(dup) > 0) {
+    print(head(dup, 20))
+    stop(object_name, " is not unique on: ", paste(keys, collapse = ", "))
+  }
+}
+
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[[1]]
+}
+```
+
+```{r load-raw}
+wellbeing <- readRDS(here("data", "wellbeing.rds"))
+pgen      <- readRDS(here("data", "pgen.rds"))      %>% zap_labels()
+biobirth  <- readRDS(here("data", "biobirth.rds"))  %>% zap_labels()
+biocouplm <- readRDS(here("data", "biocouplm.rds")) %>% zap_labels()
+
+cat("\n--- Source coverage ---\n")
+cat("wellbeing years:", min(wellbeing$syear, na.rm = TRUE), "to",
+    max(wellbeing$syear, na.rm = TRUE), "\n")
+cat("pgen years:     ", min(pgen$syear, na.rm = TRUE), "to",
+    max(pgen$syear, na.rm = TRUE), "\n")
+cat("BIOCOUPLM endy: ", min(biocouplm$endy[biocouplm$endy > 0], na.rm = TRUE),
+    "to", max(biocouplm$endy[biocouplm$endy > 0], na.rm = TRUE), "\n")
+
+assert_unique(pgen, c("pid", "syear"), "pgen")
+```
+
+```{r clean-core-datasets}
+# Life satisfaction
+swb <- wellbeing %>%
+  transmute(
+    syear,
+    pid = as.numeric(pid),
+    cid,
+    hid,
+    life_sat = if_else(plh0182 %in% 0:10, as.numeric(plh0182), NA_real_)
+  )
+assert_unique(swb, c("pid", "syear"), "swb")
+
+cat("\nLife-satisfaction range among valid values:",
+    paste(range(swb$life_sat, na.rm = TRUE), collapse = " to "), "\n")
+
+# Interview month. Invalid/nonpositive SOEP codes become NA.
+month <- pgen %>%
+  transmute(
+    syear,
+    pid = as.numeric(pid),
+    cid,
+    hid,
+    pgen_row_exists = TRUE,
+    interview_month = if_else(
+      imonth %in% 1:12,
+      as.numeric(imonth),
+      NA_real_
+    )
+  )
+assert_unique(month, c("pid", "syear"), "month")
+
+# Annual partner links. pgpartz 1-4 are eligible candidate spouse/partner links;
+# exact relationship identity is subsequently verified against BIOCOUPLM.
+partner_data_all <- pgen %>%
+  transmute(
+    syear,
+    hid,
+    cid,
+    pid = as.numeric(pid),
+    partner_id = if_else(pgpartnr > 0, as.numeric(pgpartnr), NA_real_),
+    partner_status = as.numeric(pgpartz),
+    marital_status = as.numeric(pgfamstd)
+  ) %>%
+  filter(!is.na(partner_id))
+
+cat("\n--- pgpartz among person-years with a positive partner PID ---\n")
+print(partner_data_all %>% count(partner_status))
+
+partner_data <- partner_data_all %>%
+  filter(partner_status %in% PARTNER_STATUS_CODES)
+
+n_strict_12 <- partner_data_all %>%
+  filter(partner_status %in% c(1, 2)) %>%
+  nrow()
+
+cat("Retained pgpartz codes:", paste(PARTNER_STATUS_CODES, collapse = ", "), "\n")
+cat("Person-years under strict codes 1/2:", n_strict_12, "\n")
+cat("Additional person-years contributed by codes 3/4:",
+    nrow(partner_data) - n_strict_12, "\n")
+cat("Total retained candidate partner person-years:", nrow(partner_data), "\n")
+
+# Keep all annual partner IDs for the later conflict check.
+partner_link_all <- pgen %>%
+  transmute(
+    pid = as.numeric(pid),
+    syear,
+    raw_pgpartnr = as.numeric(pgpartnr),
+    partner_id_obs = if_else(pgpartnr > 0, as.numeric(pgpartnr), NA_real_),
+    partner_status_obs = as.numeric(pgpartz)
+  )
+assert_unique(partner_link_all, c("pid", "syear"), "partner_link_all")
+
+# Annual household IDs used as a positive co-residence check later.
+# Only positive HIDs are treated as observed; missing/invalid IDs do not by
+# themselves count against a couple.
+annual_hid <- pgen %>%
+  transmute(
+    pid = as.numeric(pid),
+    syear,
+    hid_pgen = if_else(
+      as.numeric(hid) > 0,
+      as.numeric(hid),
+      NA_real_
+    )
+  )
+assert_unique(annual_hid, c("pid", "syear"), "annual_hid")
+
+# Birth history
+birth_data <- biobirth %>%
+  transmute(
+    cid,
+    pid = as.numeric(pid),
+    sex = if_else(sex %in% c(1, 2), as.numeric(sex), NA_real_),
+    num_child = if_else(sumkids >= 0, as.numeric(sumkids), NA_real_),
+    first_birth = if_else(kidgeb01 > 0, as.numeric(kidgeb01), NA_real_),
+    first_month = if_else(kidmon01 %in% 1:12, as.numeric(kidmon01), NA_real_),
+    second_birth = if_else(kidgeb02 > 0, as.numeric(kidgeb02), NA_real_),
+    second_month = if_else(kidmon02 %in% 1:12, as.numeric(kidmon02), NA_real_),
+    raw_second_birth = as.numeric(kidgeb02),
+    raw_second_month = as.numeric(kidmon02)
+  )
+assert_unique(birth_data, "pid", "birth_data")
+
+pre_consec_filter <- birth_data %>%
+  filter(
+    first_birth >= FIRST_BIRTH_MIN,
+    first_birth <= FIRST_BIRTH_MAX
+  )
+
+cat("\nPeople with a valid first birth in",
+    FIRST_BIRTH_MIN, "-", FIRST_BIRTH_MAX, ":",
+    n_distinct(pre_consec_filter$pid), "\n")
+```
+
+```{r relationship-spells}
+# BIOCOUPLM spelltyp 1 = married/spouse in household;
+# spelltyp 3 = cohabiting partner in household.
+relationship_spells <- biocouplm %>%
+  transmute(
+    pid = as.numeric(pid),
+    partner_id = if_else(partnr > 0, as.numeric(partnr), NA_real_),
+    coupid,
+    spellnr,
+    spelltyp = as.numeric(spelltyp),
+    beginy = as.numeric(beginy),
+    endy = as.numeric(endy),
+    censor = as.numeric(censor)
+  ) %>%
+  filter(
+    spelltyp %in% c(1, 3),
+    !is.na(partner_id),
+    beginy > 0,
+    endy > 0,
+    endy >= beginy
+  )
+
+# Collapse overlapping/adjacent cohabiting->married spells for the same exact
+# partner, while preserving genuine gaps as separate episodes.
+relationship_episodes <- relationship_spells %>%
+  arrange(pid, partner_id, beginy, endy) %>%
+  group_by(pid, partner_id) %>%
+  mutate(
+    previous_max_end = lag(cummax(endy)),
+    new_episode = if_else(
+      row_number() == 1L | beginy > previous_max_end + 1,
+      1L,
+      0L
+    ),
+    episode_id = cumsum(new_episode)
+  ) %>%
+  group_by(pid, partner_id, episode_id) %>%
+  summarise(
+    cohabit_start = min(beginy),
+    cohabit_end = max(endy),
+    spell_types = paste(sort(unique(spelltyp)), collapse = "+"),
+    .groups = "drop"
+  ) %>%
+  mutate(total_duration = cohabit_end - cohabit_start)
+
+cat("\nCohabiting relationship episodes:", nrow(relationship_episodes), "\n")
+cat("Unique pid-partner pairs:",
+    relationship_episodes %>% distinct(pid, partner_id) %>% nrow(), "\n")
+
+# Compatibility name used by later scripts.
+relationship_duration <- relationship_episodes
+```
+
+```{r identify-reciprocal-couples}
+# Verify each annual candidate partner link against the exact BIOCOUPLM partner
+# episode containing that survey year.
+partner_verified <- partner_data %>%
+  inner_join(
+    relationship_episodes,
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    syear >= cohabit_start,
+    syear <= cohabit_end
+  ) %>%
+  mutate(
+    couple_id = paste0(pmin(pid, partner_id), "_", pmax(pid, partner_id))
+  )
+
+assert_unique(partner_verified, c("pid", "syear"), "partner_verified")
+
+couple_members_raw <- partner_verified %>%
+  distinct(couple_id, pid, partner_id)
+
+valid_pair_ids <- couple_members_raw %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_partner_ids = n_distinct(partner_id),
+    reciprocal = setequal(unique(pid), unique(partner_id)),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_members == 2,
+    n_partner_ids == 2,
+    reciprocal
+  ) %>%
+  select(couple_id)
+
+couple_members <- couple_members_raw %>%
+  semi_join(valid_pair_ids, by = "couple_id")
+
+cat("\nReciprocal exact-partner couples identified:",
+    n_distinct(couple_members$couple_id), "\n")
+```
+
+```{r shared-first-child}
+birth_reports <- couple_members %>%
+  inner_join(pre_consec_filter, by = "pid")
+
+birth_agreement <- birth_reports %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_first_years = n_distinct(first_birth, na.rm = TRUE),
+    n_valid_months = sum(!is.na(first_month)),
+    n_first_months = n_distinct(first_month, na.rm = TRUE),
+    couple_first_birth = first_nonmissing(first_birth),
+    couple_first_month = first_nonmissing(first_month),
+    n_male = sum(sex == 1, na.rm = TRUE),
+    n_female = sum(sex == 2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    conflicting_first_month = n_valid_months == 2 & n_first_months != 1
+  )
+
+cat("\n--- Shared first-child checks ---\n")
+cat("Candidate couples with two birth-history records:",
+    sum(birth_agreement$n_members == 2), "\n")
+cat("Couples disagreeing on first-birth YEAR:",
+    sum(birth_agreement$n_members == 2 & birth_agreement$n_first_years != 1), "\n")
+cat("Couples with no valid first-birth month from either partner:",
+    sum(birth_agreement$n_members == 2 & birth_agreement$n_valid_months == 0), "\n")
+cat("Couples with exactly one valid first-birth month:",
+    sum(birth_agreement$n_members == 2 & birth_agreement$n_valid_months == 1), "\n")
+cat("Couples with two valid first-birth months that DISAGREE:",
+    sum(birth_agreement$n_members == 2 & birth_agreement$conflicting_first_month), "\n")
+cat("Couples not exactly one male + one female:",
+    sum(
+      birth_agreement$n_members == 2 &
+        !(birth_agreement$n_male == 1 & birth_agreement$n_female == 1)
+    ), "\n")
+
+# One valid month can describe the shared child. If both partners provide a
+# month, the values must agree. Month can remain missing here if neither reports
+# one; it becomes necessary only when an interview occurred in the biological
+# birth year and before/after timing must be resolved.
+shared_birth_ids <- birth_agreement %>%
+  filter(
+    n_members == 2,
+    n_first_years == 1,
+    !conflicting_first_month,
+    n_male == 1,
+    n_female == 1
+  )
+
+cat("Couples retained after shared first-child + heterosexual checks:",
+    nrow(shared_birth_ids), "\n")
+
+birth_member_data <- birth_reports %>%
+  semi_join(shared_birth_ids %>% select(couple_id), by = "couple_id") %>%
+  inner_join(
+    shared_birth_ids %>%
+      select(couple_id, couple_first_birth, couple_first_month),
+    by = "couple_id"
+  ) %>%
+  mutate(
+    first_birth = couple_first_birth,
+    first_month = couple_first_month
+  )
+```
+
+```{r first-child-reporting-year}
+first_anchor_person <- birth_member_data %>%
+  select(
+    couple_id, pid, partner_id, sex, num_child,
+    first_birth, first_month, second_birth, second_month
+  ) %>%
+  left_join(
+    month %>% select(pid, syear, pgen_row_exists, interview_month),
+    by = c("pid", "first_birth" = "syear")
+  ) %>%
+  mutate(
+    pgen_row_exists = replace_na(pgen_row_exists, FALSE),
+    first_reporting_year = case_when(
+      !pgen_row_exists ~ first_birth + 1,
+      pgen_row_exists & !is.na(interview_month) &
+        !is.na(first_month) & first_month <= interview_month ~ first_birth,
+      pgen_row_exists & !is.na(interview_month) &
+        !is.na(first_month) & first_month > interview_month ~ first_birth + 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+first_anchor_check <- first_anchor_person %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_birthyear_interviews = sum(pgen_row_exists),
+    n_valid_reporting_years = sum(!is.na(first_reporting_year)),
+    n_reporting_years = n_distinct(first_reporting_year, na.rm = TRUE),
+    reporting_year = first_nonmissing(first_reporting_year),
+    first_birth = first(first_birth),
+    first_month = first(first_month),
+    .groups = "drop"
+  )
+
+cat("\n--- First-child reporting-year alignment ---\n")
+cat("Couples with no birth-year interview for either partner:",
+    sum(first_anchor_check$n_birthyear_interviews == 0), "\n")
+cat("Couples with exactly one birth-year interview:",
+    sum(first_anchor_check$n_birthyear_interviews == 1), "\n")
+cat("Couples with two birth-year interviews:",
+    sum(first_anchor_check$n_birthyear_interviews == 2), "\n")
+cat("Couples with an unassignable reporting year for >=1 partner:",
+    sum(first_anchor_check$n_valid_reporting_years < 2), "\n")
+cat("Couples where partners map first birth to different reporting years:",
+    sum(
+      first_anchor_check$n_valid_reporting_years == 2 &
+        first_anchor_check$n_reporting_years != 1
+    ), "\n")
+
+couple_anchor <- first_anchor_check %>%
+  filter(
+    n_members == 2,
+    n_valid_reporting_years == 2,
+    n_reporting_years == 1
+  ) %>%
+  mutate(
+    window_start = reporting_year - 3,
+    window_end = reporting_year + 4
+  )
+
+cat("Couples retained after first-child reporting-year alignment:",
+    nrow(couple_anchor), "\n")
+cat("Theoretical windows ending after the last wellbeing year:",
+    sum(couple_anchor$window_end > max(wellbeing$syear, na.rm = TRUE)), "\n")
+```
+
+```{r primary-second-child-rule}
+# PRIMARY rule: exclude first and second children born in consecutive biological
+# calendar years. No later-second-child censoring is applied to the primary
+# trajectory.
+primary_second_child <- birth_member_data %>%
+  semi_join(couple_anchor %>% select(couple_id), by = "couple_id") %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    first_birth = first(first_birth),
+    n_second_years = n_distinct(second_birth, na.rm = TRUE),
+    couple_second_birth = first_nonmissing(second_birth),
+    conflicting_second_year = n_second_years > 1,
+    unresolved_second_year =
+      all(is.na(second_birth)) & any(num_child >= 2, na.rm = TRUE),
+    second_before_first =
+      !is.na(couple_second_birth) & couple_second_birth < first_birth,
+    same_year_second =
+      !is.na(couple_second_birth) & couple_second_birth == first_birth,
+    consecutive_birth_years =
+      !is.na(couple_second_birth) & couple_second_birth == first_birth + 1,
+    year_difference = if_else(
+      !is.na(couple_second_birth),
+      couple_second_birth - first_birth,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+cat("\n--- Primary second-child rule ---\n")
+cat("Couples entering rule:", nrow(primary_second_child), "\n")
+cat("Couples with conflicting valid second-birth years:",
+    sum(primary_second_child$conflicting_second_year), "\n")
+cat("Couples with >=2 children but no usable second-birth year from either partner:",
+    sum(primary_second_child$unresolved_second_year), "\n")
+cat("Couples with second birth before first (data error):",
+    sum(primary_second_child$second_before_first), "\n")
+cat("Couples with first and second child in the SAME calendar year (retained if otherwise valid):",
+    sum(primary_second_child$same_year_second), "\n")
+cat("Couples with first and second child in CONSECUTIVE calendar years (excluded):",
+    sum(primary_second_child$consecutive_birth_years), "\n")
+
+primary_second_keep <- primary_second_child %>%
+  filter(
+    !conflicting_second_year,
+    !unresolved_second_year,
+    !second_before_first,
+    !consecutive_birth_years
+  ) %>%
+  select(
+    couple_id,
+    couple_second_birth,
+    same_year_second,
+    consecutive_birth_years,
+    year_difference
+  )
+
+cat("Couples retained after primary second-child rule:",
+    nrow(primary_second_keep), "\n")
+
+# Compatibility object for downstream flow descriptions.
+post_consec_filter <- birth_member_data %>%
+  semi_join(primary_second_keep %>% select(couple_id), by = "couple_id")
+```
+
+```{r build-eight-position-window}
+parent_members <- couple_members %>%
+  semi_join(couple_anchor %>% select(couple_id), by = "couple_id") %>%
+  semi_join(primary_second_keep %>% select(couple_id), by = "couple_id") %>%
+  inner_join(
+    birth_member_data %>%
+      select(
+        couple_id, pid, sex, num_child,
+        first_birth, first_month, second_birth, second_month
+      ),
+    by = c("couple_id", "pid")
+  ) %>%
+  inner_join(
+    couple_anchor %>%
+      select(couple_id, reporting_year, window_start, window_end),
+    by = "couple_id"
+  ) %>%
+  inner_join(
+    primary_second_keep,
+    by = "couple_id"
+  )
+
+parent_window <- parent_members %>%
+  tidyr::uncount(weights = 8, .id = "signal") %>%
+  mutate(
+    signal = signal - 1L,
+    syear = window_start + signal
+  ) %>%
+  left_join(
+    swb %>% select(pid, syear, cid, hid, life_sat),
+    by = c("pid", "syear")
+  ) %>%
+  left_join(
+    month %>% select(pid, syear, interview_month),
+    by = c("pid", "syear")
+  )
+
+assert_unique(parent_window, c("couple_id", "pid", "syear"), "parent_window")
+```
+
+```{r full-window-relationship}
+# Require the exact same BIOCOUPLM relationship episode to span the full
+# theoretical signals 0-7 window for both partners.
+window_members <- parent_window %>%
+  distinct(couple_id, pid, partner_id, window_start, window_end)
+
+qualifying_episode_person <- window_members %>%
+  inner_join(
+    relationship_episodes,
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    cohabit_start <= window_start,
+    cohabit_end >= window_end
+  ) %>%
+  arrange(couple_id, pid, desc(cohabit_start)) %>%
+  group_by(couple_id, pid) %>%
+  slice(1) %>%
+  ungroup()
+
+relationship_ok_couples <- qualifying_episode_person %>%
+  group_by(couple_id) %>%
+  summarise(n_members = n_distinct(pid), .groups = "drop") %>%
+  filter(n_members == 2) %>%
+  select(couple_id)
+
+parent_window <- parent_window %>%
+  semi_join(relationship_ok_couples, by = "couple_id")
+
+qualifying_episode_person <- qualifying_episode_person %>%
+  semi_join(relationship_ok_couples, by = "couple_id")
+
+couple_relationship <- qualifying_episode_person %>%
+  group_by(couple_id) %>%
+  summarise(
+    couple_cohabit = max(cohabit_start),
+    couple_cohabit_end = min(cohabit_end),
+    start_year_difference = max(cohabit_start) - min(cohabit_start),
+    window_start = first(window_start),
+    window_end = first(window_end),
+    rel_duration_signal0 = window_start - couple_cohabit,
+    full_theoretical_window_covered = TRUE,
+    .groups = "drop"
+  )
+
+cat("\n--- Exact-partner relationship checks ---\n")
+cat("Couples retained after exact relationship covers full signals 0-7:",
+    nrow(couple_relationship), "\n")
+cat("Couples with >1-year disagreement in relationship-episode start (diagnostic only):",
+    sum(couple_relationship$start_year_difference > 1), "\n")
+cat("Relationship duration at signal 0 -- summary:\n")
+print(summary(couple_relationship$rel_duration_signal0))
+stopifnot(all(couple_relationship$rel_duration_signal0 >= 0))
+```
+
+```{r partner-constancy}
+# BIOCOUPLM is the primary source for longitudinal relationship continuity.
+# Exclude only positive annual evidence naming a different partner.
+constancy_check <- parent_window %>%
+  distinct(couple_id, pid, partner_id, signal, syear) %>%
+  left_join(partner_link_all, by = c("pid", "syear")) %>%
+  group_by(couple_id, pid) %>%
+  summarise(
+    n_same_partner = sum(partner_id_obs == partner_id, na.rm = TRUE),
+    n_conflicting_partner = sum(
+      !is.na(partner_id_obs) & partner_id_obs != partner_id,
+      na.rm = TRUE
+    ),
+    n_no_positive_partner_link = sum(is.na(partner_id_obs)),
+    .groups = "drop"
+  )
+
+cat("\n--- pgen partner-link constancy check ---\n")
+cat("People with a positive conflicting partner during signals 0-7:",
+    sum(constancy_check$n_conflicting_partner > 0), "\n")
+cat("Couples with >=1 positive conflicting partner report:",
+    constancy_check %>%
+      group_by(couple_id) %>%
+      summarise(conflict = any(n_conflicting_partner > 0), .groups = "drop") %>%
+      summarise(n = sum(conflict)) %>%
+      pull(n), "\n")
+cat("Median number of window years with no positive pgpartnr link:",
+    median(constancy_check$n_no_positive_partner_link), "\n")
+
+if (EXCLUDE_CONFLICTING_PARTNER_LINKS) {
+  no_conflict_couples <- constancy_check %>%
+    group_by(couple_id) %>%
+    summarise(
+      conflict = any(n_conflicting_partner > 0),
+      n_members = n_distinct(pid),
+      .groups = "drop"
+    ) %>%
+    filter(n_members == 2, !conflict) %>%
+    select(couple_id)
+
+  parent_window <- parent_window %>%
+    semi_join(no_conflict_couples, by = "couple_id")
+
+  couple_relationship <- couple_relationship %>%
+    semi_join(no_conflict_couples, by = "couple_id")
+}
+
+n_after_partner_conflict <- n_distinct(parent_window$couple_id)
+
+cat("Couples after partner-constancy rule:",
+    n_after_partner_conflict, "\n")
+```
+
+```{r full-window-co-residence}
+# BIOCOUPLM remains the primary longitudinal relationship source, but use the
+# annual PGEN household ID as an additional positive-evidence co-residence
+# check. If both partners have observed HIDs in the same signal year and the
+# HIDs differ, the couple is not treated as co-residing in that year.
+#
+# Missing HIDs are NOT exclusionary.
+
+co_residence_year <- parent_window %>%
+  distinct(couple_id, pid, signal, syear) %>%
+  left_join(
+    annual_hid,
+    by = c("pid", "syear")
+  ) %>%
+  group_by(couple_id, signal, syear) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_hid_observed = sum(!is.na(hid_pgen)),
+    n_distinct_hid = n_distinct(hid_pgen, na.rm = TRUE),
+    observed_hid_mismatch =
+      n_members == 2 &
+      n_hid_observed == 2 &
+      n_distinct_hid > 1,
+    .groups = "drop"
+  )
+
+cat("\n--- Full-window annual household co-residence check ---\n")
+cat("Couple-years with two observed but different HIDs:",
+    sum(co_residence_year$observed_hid_mismatch), "\n")
+
+hid_mismatch_couples <- co_residence_year %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_signal_years = n_distinct(signal),
+    any_hid_mismatch = any(observed_hid_mismatch),
+    .groups = "drop"
+  ) %>%
+  filter(any_hid_mismatch)
+
+cat("Couples with >=1 observed HID mismatch:",
+    nrow(hid_mismatch_couples), "\n")
+
+if (nrow(hid_mismatch_couples) > 0) {
+  cat("Mismatched couple-years by signal:\n")
+  print(co_residence_year %>% filter(observed_hid_mismatch) %>% count(signal))
+}
+
+if (EXCLUDE_OBSERVED_HID_MISMATCH) {
+  co_residence_ok_couples <- co_residence_year %>%
+    group_by(couple_id) %>%
+    summarise(
+      n_signal_years = n_distinct(signal),
+      any_hid_mismatch = any(observed_hid_mismatch),
+      .groups = "drop"
+    ) %>%
+    filter(
+      n_signal_years == 8,
+      !any_hid_mismatch
+    ) %>%
+    select(couple_id)
+
+  parent_window <- parent_window %>%
+    semi_join(co_residence_ok_couples, by = "couple_id")
+
+  couple_relationship <- couple_relationship %>%
+    semi_join(co_residence_ok_couples, by = "couple_id")
+}
+
+n_after_co_residence <- n_distinct(parent_window$couple_id)
+
+cat("Couples after annual HID co-residence rule:",
+    n_after_co_residence, "\n")
+```
+
+```{r life-satisfaction-eligibility}
+# Save the structurally valid, event-aligned primary parent grid BEFORE the
+# parent-only outcome-completeness rule. This is the appropriate broader parent
+# object for later comparison-group work.
+parent_window_candidates <- parent_window
+
+person_ls_eligibility <- parent_window %>%
+  group_by(couple_id, pid) %>%
+  summarise(
+    n_ls = sum(!is.na(life_sat)),
+    signal0 = any(signal == 0 & !is.na(life_sat)),
+    signal2 = any(signal == 2 & !is.na(life_sat)),
+    signal3 = any(signal == 3 & !is.na(life_sat)),
+    mandatory_ok = signal0 & signal2 & signal3,
+    .groups = "drop"
+  )
+
+cat("\n--- Life-satisfaction eligibility ---\n")
+cat("People with all mandatory signals 0,2,3:",
+    sum(person_ls_eligibility$mandatory_ok), "of",
+    nrow(person_ls_eligibility), "\n")
+cat("People with >=", MIN_LS_OBS, "of 8 observations:",
+    sum(person_ls_eligibility$n_ls >= MIN_LS_OBS), "\n")
+cat("People satisfying both rules:",
+    sum(
+      person_ls_eligibility$mandatory_ok &
+        person_ls_eligibility$n_ls >= MIN_LS_OBS
+    ), "\n")
+
+eligible_people <- person_ls_eligibility %>%
+  filter(
+    mandatory_ok,
+    n_ls >= MIN_LS_OBS
+  )
+
+eligible_ls_couples <- eligible_people %>%
+  group_by(couple_id) %>%
+  summarise(n_members = n_distinct(pid), .groups = "drop") %>%
+  filter(n_members == 2) %>%
+  select(couple_id)
+
+parent_window <- parent_window %>%
+  semi_join(eligible_ls_couples, by = "couple_id")
+
+couple_relationship <- couple_relationship %>%
+  semi_join(eligible_ls_couples, by = "couple_id")
+
+cat("Couples retained after both partners meet LS criteria:",
+    n_distinct(parent_window$couple_id), "\n")
+
+# Signal 1 remains optional.
+pre_birth_coverage <- parent_window %>%
+  filter(signal %in% 0:2) %>%
+  group_by(couple_id, pid) %>%
+  summarise(n_pre_birth_years = sum(!is.na(life_sat)), .groups = "drop")
+cat("Observed pre-birth signals (0-2) among retained people:\n")
+print(pre_birth_coverage %>% count(n_pre_birth_years))
+```
+
+```{r final-parent-objects}
+parent_window <- parent_window %>%
+  inner_join(
+    couple_relationship %>%
+      select(
+        couple_id,
+        couple_cohabit,
+        couple_cohabit_end,
+        rel_duration_signal0,
+        full_theoretical_window_covered
+      ),
+    by = "couple_id"
+  ) %>%
+  mutate(
+    relationship_duration_at_syear = syear - couple_cohabit
+  )
+
+pid_couple_check <- parent_window %>%
+  distinct(pid, couple_id) %>%
+  count(pid, name = "n_couples") %>%
+  filter(n_couples > 1)
+
+if (nrow(pid_couple_check) > 0) {
+  print(pid_couple_check)
+  stop("At least one participant belongs to more than one final parent couple.")
+}
+
+ls_partner <- parent_window
+
+ls_partner_d1 <- parent_window %>%
+  filter(
+    signal %in% MANDATORY_SIGNALS,
+    !is.na(life_sat)
+  )
+
+ls_partner_data <- parent_window %>%
+  filter(!is.na(life_sat))
+
+parent_couple_info <- parent_window %>%
+  group_by(couple_id) %>%
+  summarise(
+    first_birth = first(first_birth),
+    first_month = first(first_month),
+    reporting_year = first(reporting_year),
+    window_start = first(window_start),
+    window_end = first(window_end),
+    couple_second_birth = first(couple_second_birth),
+    year_difference = first(year_difference),
+    same_year_second = first(same_year_second),
+    couple_cohabit = first(couple_cohabit),
+    couple_cohabit_end = first(couple_cohabit_end),
+    rel_duration_signal0 = first(rel_duration_signal0),
+    full_theoretical_window_covered = first(full_theoretical_window_covered),
+    .groups = "drop"
+  )
+
+cat("\n--- FINAL PARENT SAMPLE ---\n")
+cat("Couples:", n_distinct(ls_partner_data$couple_id), "\n")
+cat("Participants:", n_distinct(ls_partner_data$pid), "\n")
+cat("Observed person-years:", nrow(ls_partner_data), "\n")
+
+flow_summary <- tibble(
+  stage = c(
+    "Reciprocal exact-partner couples",
+    "Shared first birth + heterosexual",
+    "Aligned first-child reporting year",
+    "After biological consecutive-birth rule",
+    "Exact relationship covers full 0-7 window",
+    "After partner-conflict check",
+    "After annual HID co-residence check",
+    "Both partners meet LS rule"
+  ),
+  couples = c(
+    n_distinct(couple_members$couple_id),
+    nrow(shared_birth_ids),
+    nrow(couple_anchor),
+    nrow(primary_second_keep),
+    nrow(relationship_ok_couples),
+    n_after_partner_conflict,
+    n_after_co_residence,
+    n_distinct(ls_partner_data$couple_id)
+  )
+)
+
+cat("\n--- FLOW SUMMARY ---\n")
+print(as_tibble(flow_summary))
+
+# How many final couples had pgpartz 3 or 4 during the study window?
+cat("\nFinal couples with pgpartz 3 or 4 during study window:",
+    partner_verified %>%
+      inner_join(
+        parent_couple_info %>%
+          select(couple_id, window_start, window_end),
+        by = "couple_id"
+      ) %>%
+      filter(
+        between(syear, window_start, window_end),
+        partner_status %in% c(3, 4)
+      ) %>%
+      distinct(couple_id) %>%
+      nrow(), "\n")
+
+# How many final couples had a second child during the post-event follow-up?
+# Aligned to reporting_year (signal 3), so signals 4-7 = reporting_year+1 to +4.
+cat("Final couples with a second child's birth year in post-event years +1 to +4:",
+    sum(!is.na(parent_couple_info$couple_second_birth) &
+        parent_couple_info$couple_second_birth >= parent_couple_info$reporting_year + 1 &
+        parent_couple_info$couple_second_birth <= parent_couple_info$reporting_year + 4,
+        na.rm = TRUE), "\n")
+```
+
+```{r sanity-checks}
+member_check <- ls_partner_data %>%
+  distinct(couple_id, pid, sex) %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+stopifnot(all(member_check$n_members == 2))
+stopifnot(all(member_check$n_male == 1 & member_check$n_female == 1))
+
+obs_check <- ls_partner_data %>%
+  count(couple_id, pid, name = "n_obs")
+stopifnot(all(obs_check$n_obs >= MIN_LS_OBS & obs_check$n_obs <= 8))
+
+mandatory_check <- ls_partner_data %>%
+  filter(signal %in% MANDATORY_SIGNALS) %>%
+  group_by(couple_id, pid) %>%
+  summarise(
+    has0 = any(signal == 0),
+    has2 = any(signal == 2),
+    has3 = any(signal == 3),
+    .groups = "drop"
+  )
+stopifnot(all(mandatory_check$has0 & mandatory_check$has2 & mandatory_check$has3))
+stopifnot(all(ls_partner_data$signal %in% 0:7))
+stopifnot(!anyDuplicated(ls_partner_data[, c("pid", "syear")]))
+
+shared_event_check <- ls_partner_data %>%
+  distinct(couple_id, pid, first_birth, first_month, reporting_year) %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_birth_year = n_distinct(first_birth),
+    n_birth_month = n_distinct(first_month),
+    n_reporting_year = n_distinct(reporting_year),
+    .groups = "drop"
+  )
+stopifnot(all(shared_event_check$n_birth_year == 1))
+stopifnot(all(shared_event_check$n_birth_month <= 1))
+stopifnot(all(shared_event_check$n_reporting_year == 1))
+
+# Primary second-child rule must hold in the final sample.
+stopifnot(!any(
+  !is.na(parent_couple_info$couple_second_birth) &
+    parent_couple_info$couple_second_birth == parent_couple_info$first_birth + 1
+))
+
+# Exact relationship must cover all theoretical positions 0-7.
+stopifnot(all(parent_couple_info$full_theoretical_window_covered))
+
+# Final couples must have no signal year in which both observed PGEN HIDs differ.
+final_hid_check <- ls_partner %>%
+  distinct(couple_id, pid, signal, syear) %>%
+  left_join(
+    annual_hid,
+    by = c("pid", "syear")
+  ) %>%
+  group_by(couple_id, signal, syear) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_hid_observed = sum(!is.na(hid_pgen)),
+    n_distinct_hid = n_distinct(hid_pgen, na.rm = TRUE),
+    observed_hid_mismatch =
+      n_members == 2 &
+      n_hid_observed == 2 &
+      n_distinct_hid > 1,
+    .groups = "drop"
+  )
+
+stopifnot(!any(final_hid_check$observed_hid_mismatch))
+
+# Final sample counts must match the manuscript.
+# Update these values only if the sample-construction logic is intentionally
+# changed.  Any unexpected deviation signals a code or data error.
+stopifnot(
+  n_distinct(ls_partner_data$couple_id) == 679L,
+  n_distinct(ls_partner_data$pid) == 1358L,
+  nrow(ls_partner_data) == 10746L
+)
+
+cat("\nObserved LS counts per person:\n")
+print(obs_check %>% count(n_obs))
+
+cat("\nCouples by first-birth year:\n")
+print(as_tibble(parent_couple_info %>% count(first_birth)))
+
+cat("\nRelationship duration at signal 0:\n")
+print(as_tibble(
+  parent_couple_info %>%
+    count(rel_duration_signal0) %>%
+    arrange(rel_duration_signal0)
+))
+
+cat("\nSecond-child status in final primary sample:\n")
+print(as_tibble(
+  parent_couple_info %>%
+    count(
+      has_second_birth = !is.na(couple_second_birth),
+      same_year_second
+    )
+))
+
+# Diagnostic only: check whether the theoretical eight-year observation
+# windows fall entirely within the available SOEP life-satisfaction data period.
+data_first_year <- min(swb$syear, na.rm = TRUE)
+data_last_year <- max(swb$syear, na.rm = TRUE)
+
+cat("\n--- FINAL SAMPLE PANEL-BOUNDARY DIAGNOSTIC ---\n")
+print(
+  parent_couple_info %>%
+    summarise(
+      final_couples = n(),
+      window_starts_before_data = sum(window_start < data_first_year),
+      window_ends_after_data = sum(window_end > data_last_year),
+      fully_inside_SOEP_period = sum(
+        window_start >= data_first_year & window_end <= data_last_year
+      )
+    )
+)
+```
+
+```{r sensitivity-input}
+# -------------------------------------------------------------------------
+# SENSITIVITY INPUT ONLY -- DOES NOT AFFECT PRIMARY SAMPLE SELECTION
+# -------------------------------------------------------------------------
+# Save the information needed to implement a later Krämer & Rodgers-style
+# second-child reporting/censoring sensitivity analysis in a separate script.
+# Keeping this separate prevents the alternative censoring rule from changing
+# the primary 6/8 completeness criterion.
+kr_second_child_sensitivity_input <- first_anchor_person %>%
+  semi_join(couple_anchor %>% select(couple_id), by = "couple_id") %>%
+  select(
+    couple_id,
+    pid,
+    partner_id,
+    sex,
+    num_child,
+    first_birth,
+    first_month,
+    first_reporting_year,
+    second_birth,
+    second_month
+  ) %>%
+  left_join(
+    month %>%
+      select(pid, syear, pgen_row_exists, interview_month) %>%
+      rename(
+        second_birth_year_interview_exists = pgen_row_exists,
+        second_birth_year_interview_month = interview_month
+      ),
+    by = c("pid", "second_birth" = "syear")
+  ) %>%
+  mutate(
+    second_birth_year_interview_exists =
+      replace_na(second_birth_year_interview_exists, FALSE)
+  )
+
+cat("\nSensitivity-input rows saved for later second-child censoring analysis:",
+    nrow(kr_second_child_sensitivity_input), "\n")
+```
+
+```{r save-01}
+saveRDS(swb,
+        here("data", "derived", "swb.rds"))
+saveRDS(month,
+        here("data", "derived", "month.rds"))
+saveRDS(partner_data,
+        here("data", "derived", "partner_data.rds"))
+saveRDS(partner_link_all,
+        here("data", "derived", "partner_link_all.rds"))
+saveRDS(birth_data,
+        here("data", "derived", "birth_data.rds"))
+saveRDS(pre_consec_filter,
+        here("data", "derived", "pre_consec_filter.rds"))
+saveRDS(post_consec_filter,
+        here("data", "derived", "post_consec_filter.rds"))
+saveRDS(relationship_duration,
+        here("data", "derived", "relationship_duration.rds"))
+saveRDS(relationship_episodes,
+        here("data", "derived", "relationship_episodes.rds"))
+saveRDS(couple_anchor,
+        here("data", "derived", "parent_anchor.rds"))
+saveRDS(parent_window_candidates,
+        here("data", "derived", "parent_window_candidates.rds"))
+saveRDS(co_residence_year,
+        here("data", "derived", "parent_co_residence_check.rds"))
+saveRDS(parent_couple_info,
+        here("data", "derived", "parent_couple_info.rds"))
+saveRDS(ls_partner,
+        here("data", "derived", "ls_partner.rds"))
+saveRDS(ls_partner_d1,
+        here("data", "derived", "ls_partner_d1.rds"))
+saveRDS(ls_partner_data,
+        here("data", "derived", "ls_partner_data.rds"))
+saveRDS(flow_summary,
+        here("data", "derived", "parent_flow_summary.rds"))
+saveRDS(kr_second_child_sensitivity_input,
+        here("data", "derived", "kr_second_child_sensitivity_input.rds"))
+
+cat("\nSaved rebuilt primary 01 outputs to data/derived/\n")
+```

@@ -1,0 +1,320 @@
+---
+title: "02_sample_construction"
+output: html_document
+---
+
+## Overview
+
+Takes the **locked parent-only sample produced by `01_datacleaning_primary.Rmd`**,
+adds the piecewise growth-model variables, validates the dyadic structure, and
+exports long, person-wide, and Mplus-ready files.
+
+This script **does not re-select the parent sample or re-derive the event
+anchor**. The signal variable created in `01` is the single source of truth.
+
+**Requires:** `01_datacleaning_primary.Rmd` (reads from `data/derived/`)
+
+**Outputs:**
+
+- `data/multilevel_analyses.csv` — observed long-format person-years
+- `data/sem_analyses.csv` — one row per person, signals 0–7 in wide format
+- `data/mplus_parent.dat` — one row per couple for Mplus
+- `data/derived/mplus_parent_couple_key.csv` — couple-ID crosswalk
+- `data/derived/final_parent_long.rds` — long analysis object
+- `data/derived/final_parent_wide.rds` — person-wide analysis object
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+options(scipen = 999)
+
+EXPECTED_N_COUPLES <- 679L
+EXPECTED_N_PEOPLE  <- 1358L
+EXPECTED_N_OBS     <- 10746L
+
+MIN_LS_OBS         <- 6L
+MANDATORY_SIGNALS  <- c(0L, 2L, 3L)
+MPLUS_MISSING      <- 999
+```
+
+```{r load-inputs}
+ls_partner_data     <- readRDS(here("data", "derived", "ls_partner_data.rds"))
+parent_couple_info  <- readRDS(here("data", "derived", "parent_couple_info.rds"))
+parent_flow_summary <- readRDS(here("data", "derived", "parent_flow_summary.rds"))
+
+cat("\n--- Parent sample inherited from 01 ---\n")
+cat("Couples:", n_distinct(ls_partner_data$couple_id), "\n")
+cat("Participants:", n_distinct(ls_partner_data$pid), "\n")
+cat("Observed person-years:", nrow(ls_partner_data), "\n")
+
+stopifnot(n_distinct(ls_partner_data$couple_id) == EXPECTED_N_COUPLES)
+stopifnot(n_distinct(ls_partner_data$pid) == EXPECTED_N_PEOPLE)
+stopifnot(nrow(ls_partner_data) == EXPECTED_N_OBS)
+```
+
+```{r inherited-flow}
+cat("\n--- Sample-construction flow from 01 ---\n")
+print(as_tibble(parent_flow_summary))
+```
+
+```{r growth-model-variables}
+# IMPORTANT:
+# signal was already defined in 01 from the couple-level first-child reporting
+# year. Do not reconstruct signal from first_birth/interview_month here.
+#
+# Piecewise coding (CORRECTED parameterization, matching Mplus models 10e/10f):
+#   slope1 = pre-event change: 0,1,2 and then held at 2
+#   jump   = level shift beginning at signal 3 (the event year)
+#   slope2 = post-event change: 0 at signals 0-3, then 1,2,3,4
+#
+# Under this parameterization, the jump parameter represents the TOTAL
+# change from signal 2 to signal 3 (the event-year shift). Slope2 begins
+# accumulating only at signal 4 onward.
+#
+# NOTE: An earlier version coded slope2 = pmax(signal - 2L, 0L), which gave
+# slope2 = 1 at signal 3. That matched the OLD parameterization (model 10d,
+# now superseded). The corrected coding below matches models 10a-10c, 10e, 10f.
+
+final_couples <- ls_partner_data %>%
+  mutate(
+    signal = as.integer(signal),
+    female = if_else(sex == 2, 1L, 0L),
+    male   = if_else(sex == 1, 1L, 0L),
+    slope1 = pmin(signal, 2L),
+    jump   = if_else(signal >= 3L, 1L, 0L),
+    slope2 = pmax(signal - 3L, 0L)
+  )
+
+# Expected piecewise design matrix (corrected parameterization).
+expected_growth_codes <- tibble(
+  signal = 0:7,
+  slope1 = c(0L, 1L, 2L, 2L, 2L, 2L, 2L, 2L),
+  jump   = c(0L, 0L, 0L, 1L, 1L, 1L, 1L, 1L),
+  slope2 = c(0L, 0L, 0L, 0L, 1L, 2L, 3L, 4L)
+)
+
+observed_growth_codes <- final_couples %>%
+  distinct(signal, slope1, jump, slope2) %>%
+  arrange(signal)
+
+cat("\n--- Piecewise growth coding ---\n")
+print(observed_growth_codes)
+
+stopifnot(
+  nrow(observed_growth_codes) == 8L,
+  all(observed_growth_codes$signal == expected_growth_codes$signal),
+  all(observed_growth_codes$slope1 == expected_growth_codes$slope1),
+  all(observed_growth_codes$jump   == expected_growth_codes$jump),
+  all(observed_growth_codes$slope2 == expected_growth_codes$slope2)
+)
+```
+
+```{r validation}
+cat("\n--- Structural validation ---\n")
+
+# 01 already supplied only observed life-satisfaction rows.
+stopifnot(!any(is.na(final_couples$life_sat)))
+stopifnot(all(final_couples$signal %in% 0:7))
+stopifnot(!anyDuplicated(final_couples[, c("pid", "syear")]))
+stopifnot(!anyDuplicated(final_couples[, c("couple_id", "pid", "signal")]))
+
+member_check <- final_couples %>%
+  distinct(couple_id, pid, sex) %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+
+stopifnot(all(member_check$n_members == 2))
+stopifnot(all(member_check$n_male == 1 & member_check$n_female == 1))
+
+person_check <- final_couples %>%
+  group_by(couple_id, pid) %>%
+  summarise(
+    n_obs = n(),
+    has_signal0 = any(signal == 0),
+    has_signal2 = any(signal == 2),
+    has_signal3 = any(signal == 3),
+    .groups = "drop"
+  )
+
+stopifnot(all(person_check$n_obs >= MIN_LS_OBS & person_check$n_obs <= 8))
+stopifnot(all(person_check$has_signal0 & person_check$has_signal2 & person_check$has_signal3))
+
+cat("Couples:", n_distinct(final_couples$couple_id), "\n")
+cat("Participants:", n_distinct(final_couples$pid), "\n")
+cat("Observed person-years:", nrow(final_couples), "\n")
+cat("Couples missing mandatory signals:",
+    person_check %>%
+      group_by(couple_id) %>%
+      summarise(ok = all(has_signal0 & has_signal2 & has_signal3), .groups = "drop") %>%
+      filter(!ok) %>%
+      nrow(), "\n")
+cat("Couples with fewer than 12 observed rows:",
+    final_couples %>%
+      count(couple_id, name = "n") %>%
+      filter(n < 12) %>%
+      nrow(), "\n")
+cat("Non-heterosexual couples:",
+    member_check %>%
+      filter(!(n_male == 1 & n_female == 1)) %>%
+      nrow(), "\n")
+
+cat("\nObserved LS rows per participant:\n")
+print(person_check %>% count(n_obs))
+```
+
+```{r event-anchor-validation}
+# The analytic event is the reporting-year anchor established in 01.
+# Signal 3 must therefore equal reporting_year for every observed signal-3 row.
+anchor_check <- final_couples %>%
+  filter(signal == 3) %>%
+  summarise(all_aligned = all(syear == reporting_year)) %>%
+  pull(all_aligned)
+
+stopifnot(anchor_check)
+
+# Each retained couple must have the same reporting year for both partners.
+reporting_check <- final_couples %>%
+  distinct(couple_id, pid, reporting_year) %>%
+  group_by(couple_id) %>%
+  summarise(n_reporting_years = n_distinct(reporting_year), .groups = "drop")
+
+stopifnot(all(reporting_check$n_reporting_years == 1))
+```
+
+```{r export-long-and-wide}
+# Long file contains observed person-years only, which is appropriate for
+# multilevel analyses using the available repeated observations.
+write.csv(
+  final_couples,
+  here("data", "multilevel_analyses.csv"),
+  row.names = FALSE
+)
+
+# Build an explicit 0-7 skeleton so every signal column exists even when an
+# individual is missing one or two waves.
+wide_couples <- final_couples %>%
+  select(couple_id, pid, sex, signal, life_sat) %>%
+  complete(
+    nesting(couple_id, pid, sex),
+    signal = 0:7
+  ) %>%
+  arrange(couple_id, pid, signal) %>%
+  pivot_wider(
+    names_from = signal,
+    values_from = life_sat,
+    names_prefix = "signal_"
+  ) %>%
+  select(couple_id, pid, sex, all_of(paste0("signal_", 0:7)))
+
+stopifnot(nrow(wide_couples) == EXPECTED_N_PEOPLE)
+stopifnot(!anyDuplicated(wide_couples$pid))
+
+# Re-check the 6/8 requirement in wide form.
+wide_obs_check <- wide_couples %>%
+  mutate(n_obs = rowSums(!is.na(across(all_of(paste0("signal_", 0:7))))))
+stopifnot(all(wide_obs_check$n_obs >= MIN_LS_OBS))
+
+write.csv(
+  wide_couples,
+  here("data", "sem_analyses.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  final_couples,
+  here("data", "derived", "final_parent_long.rds")
+)
+saveRDS(
+  wide_couples,
+  here("data", "derived", "final_parent_wide.rds")
+)
+
+cat("Exported multilevel_analyses.csv and sem_analyses.csv\n")
+```
+
+```{r mplus-format}
+male_wide <- wide_couples %>%
+  filter(sex == 1) %>%
+  rename_with(~ sub("signal_", "M_LS", .x), starts_with("signal_")) %>%
+  rename(PID_M = pid) %>%
+  select(couple_id, PID_M, all_of(paste0("M_LS", 0:7)))
+
+female_wide <- wide_couples %>%
+  filter(sex == 2) %>%
+  rename_with(~ sub("signal_", "F_LS", .x), starts_with("signal_")) %>%
+  rename(PID_F = pid) %>%
+  select(couple_id, PID_F, all_of(paste0("F_LS", 0:7)))
+
+stopifnot(nrow(male_wide) == EXPECTED_N_COUPLES)
+stopifnot(nrow(female_wide) == EXPECTED_N_COUPLES)
+
+mplus_couple_key <- wide_couples %>%
+  distinct(couple_id) %>%
+  arrange(couple_id) %>%
+  mutate(couple_id_num = row_number())
+
+mplus_data <- male_wide %>%
+  inner_join(female_wide, by = "couple_id") %>%
+  left_join(mplus_couple_key, by = "couple_id") %>%
+  mutate(PARENT = 1L) %>%
+  select(
+    couple_id_num,
+    PARENT,
+    PID_M,
+    all_of(paste0("M_LS", 0:7)),
+    PID_F,
+    all_of(paste0("F_LS", 0:7))
+  )
+
+stopifnot(nrow(mplus_data) == EXPECTED_N_COUPLES)
+stopifnot(!any(is.na(mplus_data$couple_id_num)))
+stopifnot(!anyDuplicated(mplus_data$PID_M))
+stopifnot(!anyDuplicated(mplus_data$PID_F))
+
+mplus_data_export <- mplus_data
+mplus_data_export[is.na(mplus_data_export)] <- MPLUS_MISSING
+
+write.table(
+  mplus_data_export,
+  here("data", "mplus_parent.dat"),
+  row.names = FALSE,
+  col.names = FALSE,
+  sep = "\t",
+  quote = FALSE
+)
+
+write.csv(
+  mplus_couple_key,
+  here("data", "derived", "mplus_parent_couple_key.csv"),
+  row.names = FALSE
+)
+
+cat("\nCouples written to mplus_parent.dat:", nrow(mplus_data_export), "\n")
+cat("Mplus missing-value code:", MPLUS_MISSING, "\n")
+cat("Variable order for the Mplus NAMES statement:\n")
+cat(
+  paste(
+    c(
+      "couple_id_num", "PARENT", "PID_M", paste0("M_LS", 0:7),
+      "PID_F", paste0("F_LS", 0:7)
+    ),
+    collapse = " "
+  ),
+  "\n"
+)
+```
+
+```{r final-summary}
+cat("\n--- FINAL 02 SUMMARY ---\n")
+cat("Parent couples:", n_distinct(final_couples$couple_id), "\n")
+cat("Participants:", n_distinct(final_couples$pid), "\n")
+cat("Observed person-years:", nrow(final_couples), "\n")
+cat("Person-wide rows:", nrow(wide_couples), "\n")
+cat("Dyadic Mplus rows:", nrow(mplus_data), "\n")
+```

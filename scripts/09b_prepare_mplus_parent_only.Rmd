@@ -1,0 +1,555 @@
+---
+title: "09b Prepare Parent-Only Mplus Data"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+
+options(scipen = 999)
+
+# -------------------------------------------------------------------------
+# PURPOSE
+# -------------------------------------------------------------------------
+# Prepare a SINGLE Mplus data file for the parent-only dyadic piecewise
+# latent growth curve model.
+#
+# Inclusion criteria (from manuscript Methods):
+#   - Parent couples only (group = 1)
+#   - Both partners must have observed life satisfaction at:
+#       signal 0 (three years before childbirth)
+#       signal 2 (one year before childbirth)
+#       signal 3 (childbirth reporting year)
+#   - Both partners must have at least 6 of 8 observed LS values
+#
+# These criteria yielded N = 679 parent couples in the original analysis.
+#
+# Unlike the multi-group model, this model:
+#   - Uses no entropy-balancing weights
+#   - Uses no multiple imputation (MI was for covariate imputation
+#     used in entropy balancing, which is not relevant here)
+#   - Exports a single data file (not TYPE = IMPUTATION)
+#
+# Missing LS values at non-required signals are retained and handled
+# by Mplus under MLR/FIML.
+# -------------------------------------------------------------------------
+
+PARENT_PATH <- here(
+  "data",
+  "derived",
+  "parent.rds"
+)
+
+MPLUS_ROOT <- here(
+  "data",
+  "mplus",
+  "parent_only"
+)
+
+stopifnot(
+  file.exists(PARENT_PATH)
+)
+
+dir.create(
+  MPLUS_ROOT,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+parent_long <- readRDS(
+  PARENT_PATH
+)
+```
+
+## 1. Verify the raw parent outcome grid
+
+```{r}
+parent_long <- parent_long %>%
+  transmute(
+    couple_id = as.character(couple_id),
+    pid = as.numeric(pid),
+    sex = as.numeric(sex),
+    signal = as.integer(signal),
+    life_sat = as.numeric(life_sat)
+  )
+
+stopifnot(
+  all(parent_long$sex %in% c(1, 2)),
+  all(parent_long$signal %in% 0:7)
+)
+
+# Every person should have exactly 8 signal positions
+person_grid <- parent_long %>%
+  group_by(
+    couple_id,
+    pid,
+    sex
+  ) %>%
+  summarise(
+    n_rows = n(),
+    n_signals = n_distinct(signal),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(person_grid$n_rows == 8L),
+  all(person_grid$n_signals == 8L)
+)
+
+# One male and one female per couple
+couple_check <- parent_long %>%
+  distinct(
+    couple_id,
+    pid,
+    sex
+  ) %>%
+  group_by(
+    couple_id
+  ) %>%
+  summarise(
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(couple_check$n_male == 1L),
+  all(couple_check$n_female == 1L)
+)
+
+n_parent_total <- n_distinct(parent_long$couple_id)
+
+cat(
+  "Total parent couples in raw data:",
+  n_parent_total,
+  "\n"
+)
+```
+
+## 2. Apply parent-only inclusion criteria
+
+Both partners must have:
+- Observed LS at signal 0 (three years before childbirth)
+- Observed LS at signal 2 (one year before childbirth)
+- Observed LS at signal 3 (childbirth reporting year)
+- At least 6 of 8 observed LS values
+
+```{r}
+person_eligibility <- parent_long %>%
+  group_by(
+    couple_id,
+    pid,
+    sex
+  ) %>%
+  summarise(
+    n_observed = sum(!is.na(life_sat)),
+    has_signal0 = !is.na(life_sat[signal == 0L]),
+    has_signal2 = !is.na(life_sat[signal == 2L]),
+    has_signal3 = !is.na(life_sat[signal == 3L]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    meets_criteria =
+      n_observed >= 6L &
+      has_signal0 &
+      has_signal2 &
+      has_signal3
+  )
+
+# Both partners must meet criteria
+couple_eligibility <- person_eligibility %>%
+  group_by(
+    couple_id
+  ) %>%
+  summarise(
+    both_eligible = all(meets_criteria),
+    .groups = "drop"
+  )
+
+eligible_couples <- couple_eligibility %>%
+  filter(
+    both_eligible
+  ) %>%
+  pull(
+    couple_id
+  )
+
+n_eligible <- length(eligible_couples)
+
+cat(
+  "Couples meeting parent-only criteria:",
+  n_eligible,
+  "\n"
+)
+
+# Report exclusions
+cat(
+  "Couples excluded:",
+  n_parent_total - n_eligible,
+  "\n"
+)
+
+# Diagnostic: reasons for exclusion
+excluded_persons <- person_eligibility %>%
+  filter(
+    !meets_criteria
+  )
+
+if (nrow(excluded_persons) > 0) {
+  cat(
+    "\nExclusion reasons among ineligible persons:\n"
+  )
+
+  cat(
+    "  Missing signal 0:",
+    sum(!excluded_persons$has_signal0),
+    "\n"
+  )
+
+  cat(
+    "  Missing signal 2:",
+    sum(!excluded_persons$has_signal2),
+    "\n"
+  )
+
+  cat(
+    "  Missing signal 3:",
+    sum(!excluded_persons$has_signal3),
+    "\n"
+  )
+
+  cat(
+    "  Fewer than 6 observed:",
+    sum(excluded_persons$n_observed < 6L),
+    "\n"
+  )
+}
+
+# Verify expected N
+if (n_eligible != 679L) {
+  warning(
+    "Expected 679 parent couples but found ",
+    n_eligible,
+    ". Check upstream pipeline if this is unexpected."
+  )
+} else {
+  cat(
+    "\nPASS: N = 679 parent couples, as expected.\n"
+  )
+}
+```
+
+## 3. Filter and pivot to wide format
+
+```{r}
+parent_eligible <- parent_long %>%
+  filter(
+    couple_id %in% eligible_couples
+  )
+
+male_wide <- parent_eligible %>%
+  filter(
+    sex == 1
+  ) %>%
+  select(
+    couple_id,
+    pid,
+    signal,
+    life_sat
+  ) %>%
+  mutate(
+    ls_name = paste0(
+      "M_LS",
+      signal
+    )
+  ) %>%
+  select(
+    -signal
+  ) %>%
+  pivot_wider(
+    id_cols = c(
+      couple_id,
+      pid
+    ),
+    names_from = ls_name,
+    values_from = life_sat
+  ) %>%
+  rename(
+    PID_M = pid
+  )
+
+female_wide <- parent_eligible %>%
+  filter(
+    sex == 2
+  ) %>%
+  select(
+    couple_id,
+    pid,
+    signal,
+    life_sat
+  ) %>%
+  mutate(
+    ls_name = paste0(
+      "F_LS",
+      signal
+    )
+  ) %>%
+  select(
+    -signal
+  ) %>%
+  pivot_wider(
+    id_cols = c(
+      couple_id,
+      pid
+    ),
+    names_from = ls_name,
+    values_from = life_sat
+  ) %>%
+  rename(
+    PID_F = pid
+  )
+
+outcome_wide <- male_wide %>%
+  inner_join(
+    female_wide,
+    by = "couple_id"
+  ) %>%
+  arrange(
+    couple_id
+  )
+
+stopifnot(
+  nrow(outcome_wide) == n_eligible,
+  n_distinct(outcome_wide$couple_id) == n_eligible
+)
+
+# Create stable numeric ID
+couple_key <- outcome_wide %>%
+  distinct(
+    couple_id
+  ) %>%
+  arrange(
+    couple_id
+  ) %>%
+  mutate(
+    couple_id_num = row_number()
+  )
+
+outcome_wide <- outcome_wide %>%
+  left_join(
+    couple_key,
+    by = "couple_id"
+  ) %>%
+  relocate(
+    couple_id_num,
+    .before = couple_id
+  )
+
+cat(
+  "Created wide-format dataset with",
+  nrow(outcome_wide),
+  "parent couples.\n"
+)
+```
+
+## 4. Export Mplus data file
+
+Column order: `couple_id_num PID_M M_LS0..M_LS7 PID_F F_LS0..F_LS7`
+
+No PARENT grouping variable (single group).
+No WEIGHT variable (no entropy balancing).
+
+```{r}
+mplus_columns <- c(
+  "couple_id_num",
+  "PID_M",
+  paste0(
+    "M_LS",
+    0:7
+  ),
+  "PID_F",
+  paste0(
+    "F_LS",
+    0:7
+  )
+)
+
+mplus_out <- outcome_wide %>%
+  select(
+    all_of(
+      mplus_columns
+    )
+  )
+
+stopifnot(
+  identical(
+    names(mplus_out),
+    mplus_columns
+  )
+)
+
+file_path <- file.path(
+  MPLUS_ROOT,
+  "parent_only.dat"
+)
+
+write.table(
+  mplus_out,
+  file = file_path,
+  row.names = FALSE,
+  col.names = FALSE,
+  quote = FALSE,
+  sep = " ",
+  na = "999"
+)
+
+# Column dictionary
+writeLines(
+  c(
+    "Mplus column order:",
+    paste(
+      mplus_columns,
+      collapse = " "
+    ),
+    "",
+    "Missing value code: 999",
+    "Single-group parent-only model (no PARENT or WEIGHT columns)",
+    paste0(
+      "Expected couples: ",
+      n_eligible
+    )
+  ),
+  con = file.path(
+    MPLUS_ROOT,
+    "parent_only_columns.txt"
+  )
+)
+
+# Save couple key for cross-referencing
+write_csv(
+  couple_key,
+  file.path(
+    MPLUS_ROOT,
+    "parent_only_couple_key.csv"
+  )
+)
+
+cat(
+  "\nExported Mplus data file:\n  ",
+  file_path,
+  "\n\n",
+  sep = ""
+)
+```
+
+## 5. Missingness summary
+
+```{r}
+missing_by_signal <- parent_eligible %>%
+  group_by(
+    sex,
+    signal
+  ) %>%
+  summarise(
+    n = n(),
+    n_observed = sum(!is.na(life_sat)),
+    n_missing = sum(is.na(life_sat)),
+    pct_missing = round(
+      100 * mean(is.na(life_sat)),
+      1
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sex_label = if_else(
+      sex == 2,
+      "Female",
+      "Male"
+    )
+  )
+
+print(
+  missing_by_signal,
+  n = Inf
+)
+
+cat(
+  "\nSignals 0, 2, and 3 should have 0% missing (required observed).\n"
+)
+
+stopifnot(
+  all(
+    missing_by_signal$pct_missing[
+      missing_by_signal$signal %in% c(0L, 2L, 3L)
+    ] == 0
+  )
+)
+
+cat(
+  "\nPASS: all required signals are fully observed.\n"
+)
+```
+
+## 6. Summary
+
+```{r}
+cat(
+  "\n====================================\n"
+)
+
+cat(
+  "09b PARENT-ONLY DATA PREPARATION\n"
+)
+
+cat(
+  "====================================\n"
+)
+
+cat(
+  "Parent couples in raw data:      ",
+  n_parent_total,
+  "\n"
+)
+
+cat(
+  "Parent couples meeting criteria: ",
+  n_eligible,
+  "\n"
+)
+
+cat(
+  "Couples excluded:                ",
+  n_parent_total - n_eligible,
+  "\n\n"
+)
+
+cat(
+  "Mplus data file:\n  ",
+  file.path(
+    MPLUS_ROOT,
+    "parent_only.dat"
+  ),
+  "\n\n",
+  sep = ""
+)
+
+cat(
+  "Next step: run 11_parent_only_model.inp in Mplus.\n",
+  "Place the .inp file in the same directory as parent_only.dat:\n  ",
+  MPLUS_ROOT,
+  "\n",
+  sep = ""
+)
+```

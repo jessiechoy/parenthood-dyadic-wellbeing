@@ -1,0 +1,703 @@
+---
+title: "08 Weighting Sensitivity Analyses — Final"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+library(mice)
+library(WeightIt)
+library(cobalt)
+
+options(scipen = 999)
+
+# -------------------------------------------------------------------------
+# PURPOSE
+# -------------------------------------------------------------------------
+# Sensitivity analyses for the locked primary entropy-balancing ATT design.
+#
+# PRIMARY ANALYSIS (07b; not re-estimated here):
+#   Full sample, mean-only entropy-balancing ATT, original 23 covariates.
+#
+# SENSITIVITY A: SUPPORT-RESTRICTED ATT
+#   - Restrict both groups to rel_duration <= 5.
+#   - Re-estimate entropy-balancing ATT weights.
+#   - Balance the original 23 covariates PLUS I(F_age^2).
+#   - The quadratic female-age term was added after diagnostics showed that
+#     F_age was the only systematic residual KS imbalance in this sensitivity
+#     analysis. Across all 20 imputations it improved F_age distributional
+#     balance without materially worsening ESS or weight tails.
+#
+# SENSITIVITY B: OVERLAP WEIGHTING
+#   - Keep the unrestricted full sample.
+#   - Use logistic propensity-score overlap weighting (ATO).
+#   - Use the original 23 covariates ONLY.
+#   - I(F_age^2) is deliberately NOT included because adding it produced
+#     estimated propensity scores numerically equal to 0 or 1 (separation).
+#
+# These are sensitivity analyses only and do not replace 07b.
+# -------------------------------------------------------------------------
+
+IMP_PATH <- here("data", "derived", "mice_imp_final.rds")
+PRIMARY_DIAG_PATH <- here("data", "derived", "ebal_att_diagnostics_by_imputation.csv")
+OUTPUT_DIR <- here("data", "derived")
+
+stopifnot(file.exists(IMP_PATH))
+
+imp <- readRDS(IMP_PATH)
+
+stopifnot(
+  inherits(imp, "mids"),
+  imp$m == 20L,
+  imp$iteration == 20L
+)
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+completed_list <- complete(imp, action = "all")
+
+stopifnot(length(completed_list) == 20L)
+
+cat("Loaded final MICE object.\n")
+cat("Imputations:", imp$m, "\n")
+cat("Iterations:", imp$iteration, "\n")
+```
+
+## 1. Weighting specifications
+
+```{r}
+BASE_FORMULA <- group_w ~
+  hinc +
+  hgowner +
+  size +
+  smallspace +
+  livedhere +
+  east +
+  hhgr +
+  rel_duration +
+  syear +
+  M_age +
+  M_life_sat +
+  M_germborn +
+  M_migration +
+  M_germcitz +
+  M_employment +
+  M_edu_level +
+  F_age +
+  F_life_sat +
+  F_germborn +
+  F_migration +
+  F_germcitz +
+  F_employment +
+  F_edu_level
+
+SUPPORT_FORMULA <- update(
+  BASE_FORMULA,
+  . ~ . + I(F_age^2)
+)
+
+base_covariates <- all.vars(BASE_FORMULA)[-1]
+
+stopifnot(
+  length(base_covariates) == 23L,
+  !anyDuplicated(base_covariates)
+)
+
+cat("Base covariates:", length(base_covariates), "\n")
+cat("\nBase formula:\n")
+print(BASE_FORMULA)
+cat("\nSupport-restricted formula:\n")
+print(SUPPORT_FORMULA)
+```
+
+## 2. Helper functions
+
+```{r}
+effective_n <- function(w) {
+  (sum(w)^2) / sum(w^2)
+}
+
+prepare_group <- function(d) {
+  d %>%
+    mutate(
+      group_num = as.numeric(as.character(group)),
+      group_w = factor(
+        group_num,
+        levels = c(0, 1),
+        labels = c("control", "parent")
+      )
+    )
+}
+
+extract_balance <- function(w, imp_number, sensitivity_name) {
+
+  b <- cobalt::bal.tab(
+    w,
+    un = TRUE,
+    stats = c("m", "v", "ks"),
+    s.d.denom = "pooled",
+    continuous = "std",
+    binary = "std",
+    poly = 2
+  )
+
+  b$Balance %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("component") %>%
+    tibble::as_tibble() %>%
+    mutate(
+      sensitivity = sensitivity_name,
+      imp = imp_number,
+      is_polynomial_term = grepl("²|\\^2|I\\(.*\\^2\\)", component),
+      .before = 1
+    )
+}
+
+make_diag <- function(d, w, balance_table, imp_number, sensitivity_name) {
+
+  ww <- w$weights
+  parent_w <- ww[d$group_w == "parent"]
+  control_w <- ww[d$group_w == "control"]
+
+  bal_original <- balance_table %>%
+    filter(!is_polynomial_term)
+
+  vr <- bal_original$V.Ratio.Adj[
+    !is.na(bal_original$V.Ratio.Adj)
+  ]
+
+  tibble(
+    sensitivity = sensitivity_name,
+    imp = imp_number,
+
+    n_parent = sum(d$group_w == "parent"),
+    n_control = sum(d$group_w == "control"),
+
+    parent_ESS = effective_n(parent_w),
+    control_ESS = effective_n(control_w),
+
+    parent_weight_min = min(parent_w),
+    parent_weight_median = median(parent_w),
+    parent_weight_p99 = quantile(parent_w, .99),
+    parent_weight_max = max(parent_w),
+
+    control_weight_min = min(control_w),
+    control_weight_median = median(control_w),
+    control_weight_p95 = quantile(control_w, .95),
+    control_weight_p99 = quantile(control_w, .99),
+    control_weight_max = max(control_w),
+
+    max_abs_SMD_original = max(abs(bal_original$Diff.Adj), na.rm = TRUE),
+    n_original_SMD_gt_05 = sum(abs(bal_original$Diff.Adj) > .05, na.rm = TRUE),
+    n_original_SMD_gt_10 = sum(abs(bal_original$Diff.Adj) > .10, na.rm = TRUE),
+
+    max_KS_original = max(bal_original$KS.Adj, na.rm = TRUE),
+    n_original_KS_gt_10 = sum(bal_original$KS.Adj > .10, na.rm = TRUE),
+
+    min_variance_ratio = min(vr, na.rm = TRUE),
+    max_variance_ratio = max(vr, na.rm = TRUE),
+    n_variance_ratio_below_05 = sum(vr < .5),
+    n_variance_ratio_above_2 = sum(vr > 2),
+
+    n_control_gt_5 = sum(control_w > 5),
+    n_control_gt_10 = sum(control_w > 10),
+    n_control_gt_20 = sum(control_w > 20)
+  )
+}
+```
+
+## 3. Input checks
+
+```{r}
+for (i in seq_along(completed_list)) {
+
+  d <- completed_list[[i]]
+
+  stopifnot(
+    nrow(d) == 1602L,
+    !anyNA(d[, c("group", base_covariates)])
+  )
+}
+
+cat(
+  "PASS: all 20 completed datasets contain 1602 couples and no missing weighting covariates.\n"
+)
+```
+
+## 4. Sensitivity A: support-restricted entropy ATT + female-age quadratic term
+
+Controls in the current design have baseline relationship duration from 0 to 5 years. This analysis therefore restricts both groups to `rel_duration <= 5`, removing parent couples outside direct relationship-duration support. The same entropy-ATT specification is then re-estimated, with an additional `F_age^2` balance constraint to address the residual female-age distributional imbalance identified during diagnostics.
+
+```{r}
+support_models <- vector("list", imp$m)
+support_weighted <- vector("list", imp$m)
+support_balance <- vector("list", imp$m)
+support_diag <- vector("list", imp$m)
+support_warnings <- vector("list", imp$m)
+
+for (i in seq_len(imp$m)) {
+
+  d <- completed_list[[i]] %>%
+    prepare_group() %>%
+    filter(rel_duration <= 5)
+
+  stopifnot(
+    !anyNA(d[, c("group_w", base_covariates)]),
+    sum(d$group_w == "parent") == 641L,
+    sum(d$group_w == "control") == 893L
+  )
+
+  fit_warnings <- character(0)
+
+  w <- withCallingHandlers(
+    weightit(
+      SUPPORT_FORMULA,
+      data = d,
+      method = "ebal",
+      estimand = "ATT",
+      focal = "parent"
+    ),
+    warning = function(x) {
+      fit_warnings <<- c(fit_warnings, conditionMessage(x))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  stopifnot(
+    length(w$weights) == nrow(d),
+    all(is.finite(w$weights)),
+    all(w$weights > 0)
+  )
+
+  bal <- extract_balance(
+    w,
+    imp_number = i,
+    sensitivity_name = "ATT entropy: rel_duration <= 5 + F_age^2"
+  )
+
+  support_models[[i]] <- w
+  support_balance[[i]] <- bal
+
+  support_diag[[i]] <- make_diag(
+    d,
+    w,
+    bal,
+    imp_number = i,
+    sensitivity_name = "ATT entropy: rel_duration <= 5 + F_age^2"
+  ) %>%
+    mutate(n_warnings = length(fit_warnings))
+
+  support_warnings[[i]] <- tibble(
+    sensitivity = "ATT entropy: rel_duration <= 5 + F_age^2",
+    imp = i,
+    warning_text = ifelse(
+      length(fit_warnings) == 0,
+      NA_character_,
+      paste(unique(fit_warnings), collapse = " | ")
+    )
+  )
+
+  support_weighted[[i]] <- d %>%
+    mutate(
+      .imp = i,
+      weight_sensitivity = w$weights,
+      .before = 1
+    )
+}
+```
+
+## 5. Sensitivity B: unrestricted overlap weighting
+
+This analysis retains all 709 parent and 893 control couples and targets the overlap population (ATO). The original 23-covariate logistic propensity-score specification is retained. A quadratic female-age term is deliberately not included because testing it produced propensity scores numerically equal to 0 or 1, indicating separation.
+
+```{r}
+ato_models <- vector("list", imp$m)
+ato_weighted <- vector("list", imp$m)
+ato_balance <- vector("list", imp$m)
+ato_diag <- vector("list", imp$m)
+ato_warnings <- vector("list", imp$m)
+
+for (i in seq_len(imp$m)) {
+
+  d <- completed_list[[i]] %>%
+    prepare_group()
+
+  stopifnot(
+    nrow(d) == 1602L,
+    sum(d$group_w == "parent") == 709L,
+    sum(d$group_w == "control") == 893L,
+    !anyNA(d[, c("group_w", base_covariates)])
+  )
+
+  fit_warnings <- character(0)
+
+  w <- withCallingHandlers(
+    weightit(
+      BASE_FORMULA,
+      data = d,
+      method = "glm",
+      estimand = "ATO"
+    ),
+    warning = function(x) {
+      fit_warnings <<- c(fit_warnings, conditionMessage(x))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  stopifnot(
+    length(w$weights) == nrow(d),
+    all(is.finite(w$weights)),
+    all(w$weights > 0)
+  )
+
+  bal <- extract_balance(
+    w,
+    imp_number = i,
+    sensitivity_name = "GLM overlap weighting: full sample"
+  )
+
+  ato_models[[i]] <- w
+  ato_balance[[i]] <- bal
+
+  ato_diag[[i]] <- make_diag(
+    d,
+    w,
+    bal,
+    imp_number = i,
+    sensitivity_name = "GLM overlap weighting: full sample"
+  ) %>%
+    mutate(n_warnings = length(fit_warnings))
+
+  ato_warnings[[i]] <- tibble(
+    sensitivity = "GLM overlap weighting: full sample",
+    imp = i,
+    warning_text = ifelse(
+      length(fit_warnings) == 0,
+      NA_character_,
+      paste(unique(fit_warnings), collapse = " | ")
+    )
+  )
+
+  ato_weighted[[i]] <- d %>%
+    mutate(
+      .imp = i,
+      weight_sensitivity = w$weights,
+      .before = 1
+    )
+}
+```
+
+## 6. Combine diagnostics
+
+```{r}
+support_diag_df <- bind_rows(support_diag)
+ato_diag_df <- bind_rows(ato_diag)
+
+sensitivity_diagnostics <- bind_rows(
+  support_diag_df,
+  ato_diag_df
+)
+
+sensitivity_balance <- bind_rows(
+  bind_rows(support_balance),
+  bind_rows(ato_balance)
+)
+
+sensitivity_warnings <- bind_rows(
+  bind_rows(support_warnings),
+  bind_rows(ato_warnings)
+)
+
+cat(
+  "Total sensitivity-analysis warnings:",
+  sum(sensitivity_diagnostics$n_warnings),
+  "\n"
+)
+
+if (any(sensitivity_diagnostics$n_warnings > 0)) {
+  print(
+    sensitivity_warnings %>%
+      filter(!is.na(warning_text)),
+    n = Inf,
+    width = Inf
+  )
+}
+```
+
+## 7. Across-imputation summary
+
+```{r}
+sensitivity_summary <- sensitivity_diagnostics %>%
+  group_by(sensitivity) %>%
+  summarise(
+    n_parent = first(n_parent),
+    n_control = first(n_control),
+
+    min_parent_ESS = min(parent_ESS),
+    median_parent_ESS = median(parent_ESS),
+
+    min_control_ESS = min(control_ESS),
+    median_control_ESS = median(control_ESS),
+
+    max_control_weight = max(control_weight_max),
+    max_parent_weight = max(parent_weight_max),
+
+    max_abs_SMD = max(max_abs_SMD_original),
+    max_n_SMD_gt_10 = max(n_original_SMD_gt_10),
+
+    max_KS = max(max_KS_original),
+    max_n_KS_gt_10 = max(n_original_KS_gt_10),
+
+    min_variance_ratio = min(min_variance_ratio),
+    max_variance_ratio = max(max_variance_ratio),
+    max_n_VR_below_05 = max(n_variance_ratio_below_05),
+    max_n_VR_above_2 = max(n_variance_ratio_above_2),
+
+    max_n_control_gt_5 = max(n_control_gt_5),
+    max_n_control_gt_10 = max(n_control_gt_10),
+    max_n_control_gt_20 = max(n_control_gt_20),
+
+    total_warnings = sum(n_warnings),
+
+    .groups = "drop"
+  )
+
+print(
+  sensitivity_summary,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 8. Female-age diagnostic
+
+```{r}
+female_age_balance <- sensitivity_balance %>%
+  filter(component == "F_age") %>%
+  select(
+    sensitivity,
+    imp,
+    Diff.Adj,
+    V.Ratio.Adj,
+    KS.Adj
+  ) %>%
+  arrange(
+    sensitivity,
+    imp
+  )
+
+print(
+  female_age_balance,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 9. Any remaining original-variable diagnostic flags
+
+```{r}
+diagnostic_flags <- sensitivity_balance %>%
+  filter(!is_polynomial_term) %>%
+  filter(
+    abs(Diff.Adj) > .10 |
+      (
+        !is.na(V.Ratio.Adj) &
+          (V.Ratio.Adj < .5 | V.Ratio.Adj > 2)
+      ) |
+      KS.Adj > .10
+  ) %>%
+  select(
+    sensitivity,
+    imp,
+    component,
+    Diff.Adj,
+    V.Ratio.Adj,
+    KS.Adj
+  ) %>%
+  arrange(
+    sensitivity,
+    desc(KS.Adj)
+  )
+
+print(
+  diagnostic_flags,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 10. Compare with locked primary entropy ATT
+
+```{r}
+if (file.exists(PRIMARY_DIAG_PATH)) {
+
+  primary_diag <- read_csv(
+    PRIMARY_DIAG_PATH,
+    show_col_types = FALSE
+  )
+
+  primary_summary <- primary_diag %>%
+    summarise(
+      sensitivity = "PRIMARY: entropy ATT, full sample",
+
+      n_parent = first(n_parent),
+      n_control = first(n_control),
+
+      min_parent_ESS = min(parent_ESS),
+      median_parent_ESS = median(parent_ESS),
+
+      min_control_ESS = min(control_ESS),
+      median_control_ESS = median(control_ESS),
+
+      max_control_weight = max(control_max),
+      max_parent_weight = max(parent_weight_max),
+
+      max_abs_SMD = max(max_abs_SMD_original),
+      max_n_SMD_gt_10 = max(n_original_SMD_gt_10),
+
+      max_KS = max(max_KS_original),
+      max_n_KS_gt_10 = max(n_original_KS_gt_10)
+    )
+
+  comparison_table <- bind_rows(
+    primary_summary,
+    sensitivity_summary %>%
+      select(
+        sensitivity,
+        n_parent,
+        n_control,
+        min_parent_ESS,
+        median_parent_ESS,
+        min_control_ESS,
+        median_control_ESS,
+        max_control_weight,
+        max_parent_weight,
+        max_abs_SMD,
+        max_n_SMD_gt_10,
+        max_KS,
+        max_n_KS_gt_10
+      )
+  )
+
+  print(
+    comparison_table,
+    n = Inf,
+    width = Inf
+  )
+}
+```
+
+## 11. Save final sensitivity objects
+
+```{r}
+support_long <- bind_rows(support_weighted)
+ato_long <- bind_rows(ato_weighted)
+
+saveRDS(
+  support_models,
+  here("data", "derived", "sensitivity_rel5_age2_ebal_models.rds")
+)
+
+saveRDS(
+  support_weighted,
+  here("data", "derived", "sensitivity_rel5_age2_ebal_datasets.rds")
+)
+
+saveRDS(
+  support_long,
+  here("data", "derived", "sensitivity_rel5_age2_ebal_long.rds")
+)
+
+saveRDS(
+  ato_models,
+  here("data", "derived", "sensitivity_ato_models.rds")
+)
+
+saveRDS(
+  ato_weighted,
+  here("data", "derived", "sensitivity_ato_datasets.rds")
+)
+
+saveRDS(
+  ato_long,
+  here("data", "derived", "sensitivity_ato_long.rds")
+)
+
+write_csv(
+  sensitivity_diagnostics,
+  here("data", "derived", "weighting_sensitivity_diagnostics_by_imputation.csv")
+)
+
+write_csv(
+  sensitivity_summary,
+  here("data", "derived", "weighting_sensitivity_summary.csv")
+)
+
+write_csv(
+  sensitivity_balance,
+  here("data", "derived", "weighting_sensitivity_balance_long.csv")
+)
+
+write_csv(
+  female_age_balance,
+  here("data", "derived", "weighting_sensitivity_female_age_balance.csv")
+)
+
+write_csv(
+  diagnostic_flags,
+  here("data", "derived", "weighting_sensitivity_diagnostic_flags.csv")
+)
+
+write_csv(
+  sensitivity_warnings,
+  here("data", "derived", "weighting_sensitivity_warnings.csv")
+)
+
+cat(
+  "\nSaved final weighting sensitivity objects and diagnostics to data/derived/.\n"
+)
+```
+
+## 12. Final summary
+
+```{r}
+cat("\n====================================\n")
+cat("08 FINAL WEIGHTING SENSITIVITY SUMMARY\n")
+cat("====================================\n")
+
+print(
+  sensitivity_summary,
+  n = Inf,
+  width = Inf
+)
+
+cat("\nRemaining diagnostic flags among original covariates:\n")
+
+print(
+  diagnostic_flags,
+  n = Inf,
+  width = Inf
+)
+
+cat("====================================\n")
+
+cat(
+  "\nSensitivity A uses rel_duration <= 5 and additionally balances F_age^2.\n"
+)
+
+cat(
+  "Sensitivity B uses the unrestricted original 23-covariate GLM ATO specification.\n"
+)
+
+cat(
+  "The locked 07b primary entropy-ATT specification remains unchanged.\n"
+)
+```

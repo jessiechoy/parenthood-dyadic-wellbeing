@@ -1,0 +1,1053 @@
+---
+title: "09 Prepare Weighted Longitudinal Outcome Data for Mplus"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+
+options(scipen = 999)
+
+# -------------------------------------------------------------------------
+# PURPOSE
+# -------------------------------------------------------------------------
+# Prepare the 8-wave dyadic life-satisfaction outcome data for Mplus.
+#
+# This file DOES NOT estimate the growth model.
+#
+# It:
+#   1. Builds one couple-level outcome file with male and female LS at signals 0-7.
+#   2. Joins the imputation-specific weights from:
+#        a) locked primary entropy ATT (07b),
+#        b) support-restricted entropy ATT sensitivity (08),
+#        c) full-sample ATO sensitivity (08).
+#   3. Exports 20 Mplus data files per specification plus TYPE=IMPUTATION
+#      list files.
+#   4. Leaves longitudinal outcome missingness untouched. Missing LS is coded
+#      999 only at export for Mplus FIML.
+#
+# IMPORTANT:
+# - Covariate imputation affects the weights, not the observed LS outcomes.
+# - The same observed LS trajectories are therefore used in all 20 imputations.
+# - No outcome values are imputed here.
+# - No growth-factor variances are fixed here. Those constraints must be
+#   re-evaluated in the rebuilt weighted sample rather than copied from the
+#   old Mplus model.
+# -------------------------------------------------------------------------
+
+PARENT_PATH <- here(
+  "data",
+  "derived",
+  "parent.rds"
+)
+
+CONTROL_PATH <- here(
+  "data",
+  "derived",
+  "childless.rds"
+)
+
+PRIMARY_WEIGHTS_PATH <- here(
+  "data",
+  "derived",
+  "ebal_att_datasets.rds"
+)
+
+SUPPORT_WEIGHTS_PATH <- here(
+  "data",
+  "derived",
+  "sensitivity_rel5_age2_ebal_datasets.rds"
+)
+
+ATO_WEIGHTS_PATH <- here(
+  "data",
+  "derived",
+  "sensitivity_ato_datasets.rds"
+)
+
+MPLUS_ROOT <- here(
+  "data",
+  "mplus"
+)
+
+paths_required <- c(
+  PARENT_PATH,
+  CONTROL_PATH,
+  PRIMARY_WEIGHTS_PATH,
+  SUPPORT_WEIGHTS_PATH,
+  ATO_WEIGHTS_PATH
+)
+
+stopifnot(
+  all(
+    file.exists(
+      paths_required
+    )
+  )
+)
+
+dir.create(
+  MPLUS_ROOT,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+parent_long <- readRDS(
+  PARENT_PATH
+)
+
+control_long <- readRDS(
+  CONTROL_PATH
+)
+
+primary_weighted <- readRDS(
+  PRIMARY_WEIGHTS_PATH
+)
+
+support_weighted <- readRDS(
+  SUPPORT_WEIGHTS_PATH
+)
+
+ato_weighted <- readRDS(
+  ATO_WEIGHTS_PATH
+)
+
+stopifnot(
+  length(primary_weighted) == 20L,
+  length(support_weighted) == 20L,
+  length(ato_weighted) == 20L
+)
+
+cat("Loaded outcome grids and all three weighting specifications.\n")
+```
+
+## 1. Build the common observed outcome grid
+
+SOEP sex coding in the rebuilt sample is `1 = male`, `2 = female`.
+
+```{r}
+outcome_long <- bind_rows(
+  parent_long %>%
+    mutate(group_expected = 1L),
+  control_long %>%
+    mutate(group_expected = 0L)
+) %>%
+  transmute(
+    couple_id = as.character(couple_id),
+    group = as.integer(group_expected),
+    pid = as.numeric(pid),
+    sex = as.numeric(sex),
+    signal = as.integer(signal),
+    syear = as.integer(syear),
+    life_sat = as.numeric(life_sat)
+  )
+
+stopifnot(
+  all(outcome_long$group %in% c(0L, 1L)),
+  all(outcome_long$sex %in% c(1, 2)),
+  all(outcome_long$signal %in% 0:7)
+)
+
+# Every person should have exactly the 8 theoretical signal positions.
+person_grid_check <- outcome_long %>%
+  group_by(
+    couple_id,
+    group,
+    pid,
+    sex
+  ) %>%
+  summarise(
+    n_rows = n(),
+    n_signals = n_distinct(signal),
+    min_signal = min(signal),
+    max_signal = max(signal),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(person_grid_check$n_rows == 8L),
+  all(person_grid_check$n_signals == 8L),
+  all(person_grid_check$min_signal == 0L),
+  all(person_grid_check$max_signal == 7L)
+)
+
+# Exactly one male and one female per couple.
+couple_structure_check <- outcome_long %>%
+  distinct(
+    couple_id,
+    group,
+    pid,
+    sex
+  ) %>%
+  group_by(
+    couple_id,
+    group
+  ) %>%
+  summarise(
+    n_people = n_distinct(pid),
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(couple_structure_check$n_people == 2L),
+  all(couple_structure_check$n_male == 1L),
+  all(couple_structure_check$n_female == 1L)
+)
+
+group_counts <- couple_structure_check %>%
+  count(
+    group,
+    name = "n_couples"
+  ) %>%
+  arrange(group)
+
+print(group_counts)
+
+stopifnot(
+  group_counts$n_couples[group_counts$group == 1L] == 709L,
+  group_counts$n_couples[group_counts$group == 0L] == 893L
+)
+
+# Multi-group eligibility required observed LS at signal 0 for both partners.
+baseline_ls_check <- outcome_long %>%
+  filter(signal == 0L) %>%
+  group_by(
+    couple_id
+  ) %>%
+  summarise(
+    n_people = n_distinct(pid),
+    n_observed_ls = sum(!is.na(life_sat)),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(baseline_ls_check$n_people == 2L),
+  all(baseline_ls_check$n_observed_ls == 2L)
+)
+
+cat(
+  "PASS: common outcome grid contains 709 parent and 893 control couples,\n",
+  "with one male + one female and complete signal-0 LS for both partners.\n",
+  sep = ""
+)
+```
+
+## 2. Describe longitudinal outcome missingness
+
+The multi-group sample does **not** require complete LS at signals 1–7. These missing outcome values remain missing and will be handled by Mplus under MLR/FIML.
+
+```{r}
+outcome_coverage <- outcome_long %>%
+  group_by(
+    group,
+    sex,
+    pid
+  ) %>%
+  summarise(
+    n_ls = sum(!is.na(life_sat)),
+    .groups = "drop"
+  ) %>%
+  count(
+    group,
+    sex,
+    n_ls,
+    name = "n_people"
+  ) %>%
+  arrange(
+    group,
+    sex,
+    n_ls
+  )
+
+print(
+  outcome_coverage,
+  n = Inf
+)
+
+missing_by_signal <- outcome_long %>%
+  group_by(
+    group,
+    sex,
+    signal
+  ) %>%
+  summarise(
+    n = n(),
+    n_observed = sum(!is.na(life_sat)),
+    n_missing = sum(is.na(life_sat)),
+    pct_missing = 100 * mean(is.na(life_sat)),
+    .groups = "drop"
+  )
+
+print(
+  missing_by_signal,
+  n = Inf
+)
+
+stopifnot(
+  !any(
+    outcome_coverage$n_ls == 0
+  )
+)
+```
+
+## 3. Convert observed outcomes to one row per couple
+
+```{r}
+male_wide <- outcome_long %>%
+  filter(
+    sex == 1
+  ) %>%
+  select(
+    couple_id,
+    group,
+    pid,
+    signal,
+    life_sat
+  ) %>%
+  mutate(
+    ls_name = paste0(
+      "M_LS",
+      signal
+    )
+  ) %>%
+  select(
+    -signal
+  ) %>%
+  pivot_wider(
+    id_cols = c(
+      couple_id,
+      group,
+      pid
+    ),
+    names_from = ls_name,
+    values_from = life_sat
+  ) %>%
+  rename(
+    PID_M = pid
+  )
+
+female_wide <- outcome_long %>%
+  filter(
+    sex == 2
+  ) %>%
+  select(
+    couple_id,
+    group,
+    pid,
+    signal,
+    life_sat
+  ) %>%
+  mutate(
+    ls_name = paste0(
+      "F_LS",
+      signal
+    )
+  ) %>%
+  select(
+    -signal
+  ) %>%
+  pivot_wider(
+    id_cols = c(
+      couple_id,
+      group,
+      pid
+    ),
+    names_from = ls_name,
+    values_from = life_sat
+  ) %>%
+  rename(
+    PID_F = pid
+  )
+
+outcome_wide <- male_wide %>%
+  inner_join(
+    female_wide,
+    by = c(
+      "couple_id",
+      "group"
+    )
+  ) %>%
+  arrange(
+    couple_id
+  )
+
+expected_ls_names <- c(
+  paste0("M_LS", 0:7),
+  paste0("F_LS", 0:7)
+)
+
+stopifnot(
+  nrow(outcome_wide) == 1602L,
+  n_distinct(outcome_wide$couple_id) == 1602L,
+  all(
+    expected_ls_names %in%
+      names(outcome_wide)
+  )
+)
+
+# Stable numeric Mplus ID. This ID is for tracking only; all joins are done
+# with the original string couple_id before export.
+couple_key <- outcome_wide %>%
+  distinct(
+    couple_id
+  ) %>%
+  arrange(
+    couple_id
+  ) %>%
+  mutate(
+    couple_id_num = row_number()
+  )
+
+outcome_wide <- outcome_wide %>%
+  left_join(
+    couple_key,
+    by = "couple_id"
+  ) %>%
+  relocate(
+    couple_id_num,
+    .before = couple_id
+  )
+
+saveRDS(
+  outcome_wide,
+  here(
+    "data",
+    "derived",
+    "mplus_outcome_wide.rds"
+  )
+)
+
+write_csv(
+  couple_key,
+  here(
+    "data",
+    "derived",
+    "mplus_couple_key.csv"
+  )
+)
+
+cat(
+  "PASS: created one-row-per-couple observed outcome dataset.\n"
+)
+```
+
+## 4. Mplus export specification
+
+Each exported Mplus file has exactly this column order:
+
+1. `couple_id_num`
+2. `PARENT`
+3. `PID_M`
+4. `M_LS0` … `M_LS7`
+5. `PID_F`
+6. `F_LS0` … `F_LS7`
+7. `WEIGHT`
+
+Missing LS values are written as `999`.
+
+```{r}
+mplus_columns <- c(
+  "couple_id_num",
+  "PARENT",
+  "PID_M",
+  paste0(
+    "M_LS",
+    0:7
+  ),
+  "PID_F",
+  paste0(
+    "F_LS",
+    0:7
+  ),
+  "WEIGHT"
+)
+
+mplus_names_text <- paste(
+  mplus_columns,
+  collapse = " "
+)
+
+cat(
+  "Mplus column order:\n",
+  mplus_names_text,
+  "\n"
+)
+```
+
+## 5. Helper for joining weights and exporting 20 imputations
+
+```{r}
+normalise_weight_frame <- function(
+  d,
+  weight_var
+) {
+
+  stopifnot(
+    "couple_id" %in% names(d),
+    weight_var %in% names(d)
+  )
+
+  if ("group_num" %in% names(d)) {
+
+    group_num <-
+      as.integer(
+        d$group_num
+      )
+
+  } else if ("group" %in% names(d)) {
+
+    group_num <-
+      suppressWarnings(
+        as.integer(
+          as.character(
+            d$group
+          )
+        )
+      )
+
+  } else {
+
+    stop(
+      "Weight dataset has neither group_num nor group."
+    )
+  }
+
+  tibble(
+    couple_id =
+      as.character(
+        d$couple_id
+      ),
+    group_weight =
+      group_num,
+    WEIGHT =
+      as.numeric(
+        d[[weight_var]]
+      )
+  )
+}
+
+
+export_mplus_imputations <- function(
+  weight_list,
+  weight_var,
+  specification_name,
+  expected_parent_n,
+  expected_control_n
+) {
+
+  out_dir <- file.path(
+    MPLUS_ROOT,
+    specification_name
+  )
+
+  dir.create(
+    out_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  stopifnot(
+    length(weight_list) == 20L
+  )
+
+  export_diagnostics <- vector(
+    "list",
+    20L
+  )
+
+  exported_outcomes <- vector(
+    "list",
+    20L
+  )
+
+  file_names <- character(
+    20L
+  )
+
+  for (i in seq_len(20L)) {
+
+    weights_i <- normalise_weight_frame(
+      weight_list[[i]],
+      weight_var = weight_var
+    )
+
+    stopifnot(
+      nrow(weights_i) ==
+        expected_parent_n +
+        expected_control_n,
+      n_distinct(
+        weights_i$couple_id
+      ) ==
+        nrow(
+          weights_i
+        ),
+      all(
+        is.finite(
+          weights_i$WEIGHT
+        )
+      ),
+      all(
+        weights_i$WEIGHT > 0
+      )
+    )
+
+    analysis_i <- outcome_wide %>%
+      inner_join(
+        weights_i,
+        by = "couple_id"
+      )
+
+    stopifnot(
+      nrow(
+        analysis_i
+      ) ==
+        expected_parent_n +
+        expected_control_n,
+      all(
+        analysis_i$group ==
+          analysis_i$group_weight
+      ),
+      sum(
+        analysis_i$group == 1L
+      ) ==
+        expected_parent_n,
+      sum(
+        analysis_i$group == 0L
+      ) ==
+        expected_control_n
+    )
+
+    analysis_i <- analysis_i %>%
+      mutate(
+        PARENT = group
+      )
+
+    mplus_i <- analysis_i %>%
+      select(
+        couple_id_num,
+        PARENT,
+        PID_M,
+        all_of(
+          paste0(
+            "M_LS",
+            0:7
+          )
+        ),
+        PID_F,
+        all_of(
+          paste0(
+            "F_LS",
+            0:7
+          )
+        ),
+        WEIGHT
+      )
+
+    stopifnot(
+      identical(
+        names(
+          mplus_i
+        ),
+        mplus_columns
+      )
+    )
+
+    # Store outcome-only portion so we can prove outcomes do not vary by
+    # imputation. Weight is deliberately excluded from this check.
+    exported_outcomes[[i]] <-
+      mplus_i %>%
+      select(
+        -WEIGHT
+      )
+
+    file_name <- sprintf(
+      "%s_imp%02d.dat",
+      specification_name,
+      i
+    )
+
+    file_path <- file.path(
+      out_dir,
+      file_name
+    )
+
+    write.table(
+      mplus_i,
+      file = file_path,
+      row.names = FALSE,
+      col.names = FALSE,
+      quote = FALSE,
+      sep = " ",
+      na = "999"
+    )
+
+    file_names[i] <-
+      file_name
+
+    parent_w <-
+      mplus_i$WEIGHT[
+        mplus_i$PARENT == 1L
+      ]
+
+    control_w <-
+      mplus_i$WEIGHT[
+        mplus_i$PARENT == 0L
+      ]
+
+    export_diagnostics[[i]] <- tibble(
+      specification =
+        specification_name,
+      imp =
+        i,
+      n =
+        nrow(
+          mplus_i
+        ),
+      n_parent =
+        sum(
+          mplus_i$PARENT == 1L
+        ),
+      n_control =
+        sum(
+          mplus_i$PARENT == 0L
+        ),
+      parent_weight_min =
+        min(
+          parent_w
+        ),
+      parent_weight_max =
+        max(
+          parent_w
+        ),
+      control_weight_min =
+        min(
+          control_w
+        ),
+      control_weight_median =
+        median(
+          control_w
+        ),
+      control_weight_max =
+        max(
+          control_w
+        ),
+      n_missing_ls =
+        sum(
+          is.na(
+            mplus_i[
+              ,
+              c(
+                paste0(
+                  "M_LS",
+                  0:7
+                ),
+                paste0(
+                  "F_LS",
+                  0:7
+                )
+              )
+            ]
+          )
+        )
+    )
+  }
+
+  # Observed outcome trajectories and IDs must be exactly identical across
+  # imputations; only the weights should differ.
+  for (i in 2:20) {
+    stopifnot(
+      identical(
+        exported_outcomes[[1]],
+        exported_outcomes[[i]]
+      )
+    )
+  }
+
+  # Mplus TYPE=IMPUTATION list file. Because the Mplus .inp will be placed
+  # in this same directory, filenames can remain relative.
+  list_file <- file.path(
+    out_dir,
+    paste0(
+      specification_name,
+      "_list.dat"
+    )
+  )
+
+  writeLines(
+    file_names,
+    con = list_file
+  )
+
+  # Small text dictionary to make the exported column order explicit.
+  writeLines(
+    c(
+      "Mplus column order:",
+      mplus_names_text,
+      "",
+      "Missing value code: 999",
+      "PARENT: 0 = non-parenting control; 1 = parent",
+      paste0(
+        "Expected couples: ",
+        expected_parent_n,
+        " parents + ",
+        expected_control_n,
+        " controls"
+      )
+    ),
+    con = file.path(
+      out_dir,
+      paste0(
+        specification_name,
+        "_columns.txt"
+      )
+    )
+  )
+
+  bind_rows(
+    export_diagnostics
+  )
+}
+```
+
+## 6. Export locked primary entropy-ATT analysis
+
+```{r}
+diag_primary <- export_mplus_imputations(
+  weight_list =
+    primary_weighted,
+  weight_var =
+    "att_weight_ebal",
+  specification_name =
+    "primary_entropy_att",
+  expected_parent_n =
+    709L,
+  expected_control_n =
+    893L
+)
+
+print(
+  diag_primary,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 7. Export support-restricted ATT sensitivity
+
+This sensitivity contains the 641 parent couples with `rel_duration <= 5` and all 893 controls.
+
+```{r}
+diag_support <- export_mplus_imputations(
+  weight_list =
+    support_weighted,
+  weight_var =
+    "weight_sensitivity",
+  specification_name =
+    "sensitivity_rel5_age2_att",
+  expected_parent_n =
+    641L,
+  expected_control_n =
+    893L
+)
+
+print(
+  diag_support,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 8. Export full-sample ATO sensitivity
+
+```{r}
+diag_ato <- export_mplus_imputations(
+  weight_list =
+    ato_weighted,
+  weight_var =
+    "weight_sensitivity",
+  specification_name =
+    "sensitivity_ato",
+  expected_parent_n =
+    709L,
+  expected_control_n =
+    893L
+)
+
+print(
+  diag_ato,
+  n = Inf,
+  width = Inf
+)
+```
+
+## 9. Cross-specification checks
+
+```{r}
+export_diagnostics <- bind_rows(
+  diag_primary,
+  diag_support,
+  diag_ato
+)
+
+write_csv(
+  export_diagnostics,
+  here(
+    "data",
+    "derived",
+    "mplus_export_diagnostics.csv"
+  )
+)
+
+export_summary <- export_diagnostics %>%
+  group_by(
+    specification
+  ) %>%
+  summarise(
+    imputations =
+      n(),
+    n_min =
+      min(
+        n
+      ),
+    n_max =
+      max(
+        n
+      ),
+    parent_n =
+      first(
+        n_parent
+      ),
+    control_n =
+      first(
+        n_control
+      ),
+    min_parent_weight =
+      min(
+        parent_weight_min
+      ),
+    max_parent_weight =
+      max(
+        parent_weight_max
+      ),
+    min_control_weight =
+      min(
+        control_weight_min
+      ),
+    max_control_weight =
+      max(
+        control_weight_max
+      ),
+    missing_ls_min =
+      min(
+        n_missing_ls
+      ),
+    missing_ls_max =
+      max(
+        n_missing_ls
+      ),
+    .groups = "drop"
+  )
+
+print(
+  export_summary,
+  n = Inf,
+  width = Inf
+)
+
+stopifnot(
+  all(
+    export_summary$imputations ==
+      20L
+  ),
+  all(
+    export_summary$missing_ls_min ==
+      export_summary$missing_ls_max
+  )
+)
+
+cat(
+  "\nPASS: all Mplus specifications contain 20 imputations,\n",
+  "and the observed LS missingness pattern is identical across imputations.\n",
+  sep = ""
+)
+```
+
+## 10. Final file locations
+
+```{r}
+cat(
+  "\n====================================\n"
+)
+
+cat(
+  "09 MPLUS DATA PREPARATION SUMMARY\n"
+)
+
+cat(
+  "====================================\n"
+)
+
+cat(
+  "Primary Mplus directory:\n  ",
+  file.path(
+    MPLUS_ROOT,
+    "primary_entropy_att"
+  ),
+  "\n\n",
+  sep = ""
+)
+
+cat(
+  "Support sensitivity Mplus directory:\n  ",
+  file.path(
+    MPLUS_ROOT,
+    "sensitivity_rel5_age2_att"
+  ),
+  "\n\n",
+  sep = ""
+)
+
+cat(
+  "ATO sensitivity Mplus directory:\n  ",
+  file.path(
+    MPLUS_ROOT,
+    "sensitivity_ato"
+  ),
+  "\n\n",
+  sep = ""
+)
+
+cat(
+  "Primary TYPE=IMPUTATION list file:\n  primary_entropy_att_list.dat\n"
+)
+
+cat(
+  "Support TYPE=IMPUTATION list file:\n  sensitivity_rel5_age2_att_list.dat\n"
+)
+
+cat(
+  "ATO TYPE=IMPUTATION list file:\n  sensitivity_ato_list.dat\n"
+)
+
+cat(
+  "\nNext step: fit a preliminary multi-group dyadic piecewise growth model\n",
+  "with all growth-factor variances initially free. Do not carry the old\n",
+  "zero-variance constraints forward until they are re-checked in the rebuilt\n",
+  "sample and weighting specification.\n",
+  sep = ""
+)
+```

@@ -1,0 +1,1458 @@
+---
+title: "03_covariates_ipw_sample_rebuilt_v5_citizenship_backfill"
+output: html_document
+---
+
+## Overview
+
+Constructs the parent and non-parenting samples for the multi-group analysis,
+assigns the non-parenting pseudo-event window, attaches the propensity-score
+covariates at **signal 0 / baseline**, and assembles the person-level IPW input.
+
+**Requires:** rebuilt `01_datacleaning_primary.Rmd`
+
+**Key design decisions**
+
+- Parent multi-group sample starts from the structurally eligible parent grid
+  **before** the parent-only 6/8 life-satisfaction rule.
+- Signal 0 is the growth-model baseline and the covariate/IPW year.
+- For non-parenting couples, signal 0 is randomly sampled from cohabitation
+  year through cohabitation + 5 years.
+- The non-parent pseudo-event is signal 3 = baseline + 3 years.
+- Both groups require the same exact partner throughout signals 0-7.
+- If both partners have observed positive PGEN household IDs in a signal year,
+  those HIDs must match. Missing HIDs alone are not exclusionary.
+- Both partners must have observed life satisfaction at signal 0 / baseline.
+  Other missing propensity-score covariates are retained for later multiple
+  imputation.
+- Parents with baseline relationship duration >5 years are retained for now.
+  Common support is evaluated later using propensity-score diagnostics rather
+  than imposed here.
+- Two isolated missing baseline German-citizenship values are recovered from
+  each respondent's repeated, concordant nationality reports in subsequent
+  SOEP waves before multiple imputation.
+
+**Outputs** (to `data/derived/`):
+
+- `parent.rds` — full 8-signal parent multi-group grid
+- `parent_sample.rds` — parent signal-0/IPW rows
+- `childless.rds` — full 8-signal non-parenting grid
+- `childless_sample.rds` — non-parent signal-0/IPW rows
+- `childless_anchor.rds` — reproducible random baseline/pseudo-event assignment
+- `ipw_sample.rds` — combined person-level baseline covariate data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(haven)
+library(here)
+
+options(scipen = 999)
+
+RANDOM_SEED <- 42L
+BASELINE_OFFSETS <- 0:5
+
+assert_unique <- function(data, keys, object_name) {
+  dup <- data %>%
+    group_by(across(all_of(keys))) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    filter(n > 1)
+
+  if (nrow(dup) > 0) {
+    print(head(dup, 20))
+    stop(object_name, " is not unique on: ", paste(keys, collapse = ", "))
+  }
+}
+```
+
+```{r load-inputs}
+swb                   <- readRDS(here("data", "derived", "swb.rds"))
+partner_data          <- readRDS(here("data", "derived", "partner_data.rds"))
+partner_link_all      <- readRDS(here("data", "derived", "partner_link_all.rds"))
+relationship_episodes <- readRDS(here("data", "derived", "relationship_episodes.rds"))
+
+parent_candidates <- readRDS(
+  here("data", "derived", "parent_window_candidates.rds")
+)
+
+pgen     <- readRDS(here("data", "pgen.rds"))     %>% zap_labels()
+biobirth <- readRDS(here("data", "biobirth.rds")) %>% zap_labels()
+bioedu   <- readRDS(here("data", "bioedu.rds"))   %>% zap_labels()
+ppathl   <- readRDS(here("data", "ppathl.rds"))   %>% zap_labels()
+hgen     <- readRDS(here("data", "hgen.rds"))     %>% zap_labels()
+hbrutto  <- readRDS(here("data", "hbrutto.rds"))  %>% zap_labels()
+
+pgen     <- pgen     %>% mutate(pid = as.numeric(pid))
+biobirth <- biobirth %>% mutate(pid = as.numeric(pid))
+bioedu   <- bioedu   %>% mutate(pid = as.numeric(pid))
+ppathl   <- ppathl   %>% mutate(pid = as.numeric(pid))
+
+assert_unique(pgen, c("pid", "syear"), "pgen")
+assert_unique(swb,  c("pid", "syear"), "swb")
+
+# Annual household ID used as a positive-evidence co-residence check.
+# Only positive HIDs are treated as observed. Missing/invalid HIDs do not by
+# themselves count against a couple.
+annual_hid <- pgen %>%
+  transmute(
+    pid,
+    syear,
+    hid_pgen = if_else(
+      as.numeric(hid) > 0,
+      as.numeric(hid),
+      NA_real_
+    )
+  )
+
+assert_unique(
+  annual_hid,
+  c("pid", "syear"),
+  "annual_hid"
+)
+
+DATA_FIRST_YEAR <- min(swb$syear, na.rm = TRUE)
+DATA_LAST_YEAR  <- max(swb$syear, na.rm = TRUE)
+
+cat("\nSOEP outcome coverage:", DATA_FIRST_YEAR, "to", DATA_LAST_YEAR, "\n")
+cat("Structural parent couples inherited from 01:",
+    n_distinct(parent_candidates$couple_id), "\n")
+```
+
+```{r parent-multigroup-sample}
+parent_rel_person <- parent_candidates %>%
+  distinct(
+    couple_id, pid, partner_id,
+    window_start, window_end
+  ) %>%
+  inner_join(
+    relationship_episodes,
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    cohabit_start <= window_start,
+    cohabit_end >= window_end
+  ) %>%
+  arrange(couple_id, pid, desc(cohabit_start)) %>%
+  group_by(couple_id, pid) %>%
+  slice(1) %>%
+  ungroup()
+
+parent_rel <- parent_rel_person %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    couple_cohabit = max(cohabit_start),
+    couple_cohabit_end = min(cohabit_end),
+    .groups = "drop"
+  ) %>%
+  filter(n_members == 2)
+
+stopifnot(
+  nrow(parent_rel) == n_distinct(parent_candidates$couple_id)
+)
+
+parent <- parent_candidates %>%
+  left_join(
+    parent_rel %>%
+      select(couple_id, couple_cohabit, couple_cohabit_end),
+    by = "couple_id"
+  ) %>%
+  mutate(
+    baseline_year = window_start,
+    event_year = reporting_year,
+    group = 1L,
+    rel_duration = baseline_year - couple_cohabit
+  )
+
+assert_unique(parent, c("couple_id", "pid", "signal"), "parent")
+
+# Sanity check: cleaned 01 should already guarantee no signal year in which
+# both partners have observed positive HIDs that disagree.
+parent_hid_check <- parent %>%
+  distinct(couple_id, pid, signal, syear) %>%
+  left_join(
+    annual_hid,
+    by = c("pid", "syear")
+  ) %>%
+  group_by(couple_id, signal, syear) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_hid_observed = sum(!is.na(hid_pgen)),
+    n_distinct_hid = n_distinct(hid_pgen, na.rm = TRUE),
+    observed_hid_mismatch =
+      n_members == 2 &
+      n_hid_observed == 2 &
+      n_distinct_hid > 1,
+    .groups = "drop"
+  )
+
+cat("\nParent signal-years with observed HID mismatch:",
+    sum(parent_hid_check$observed_hid_mismatch), "\n")
+
+stopifnot(!any(parent_hid_check$observed_hid_mismatch))
+
+# Multi-group outcome eligibility:
+# BOTH partners must have observed life satisfaction at signal 0 / baseline.
+# Do NOT apply the parent-only 6/8 + mandatory-signal rule here.
+parent_baseline_ok <- parent %>%
+  filter(signal == 0) %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    both_baseline_ls = sum(!is.na(life_sat)) == 2,
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_members == 2,
+    both_baseline_ls
+  ) %>%
+  select(couple_id)
+
+cat("\nParent couples before signal-0 LS requirement:",
+    n_distinct(parent$couple_id), "\n")
+cat("Parent couples with both partners observed at signal 0:",
+    nrow(parent_baseline_ok), "\n")
+
+# Keep the full 8-signal grid only for multi-group-eligible parent couples.
+parent <- parent %>%
+  semi_join(parent_baseline_ok, by = "couple_id")
+
+# Signal 0 is the IPW / baseline year.
+parent_sample <- parent %>%
+  filter(signal == 0) %>%
+  select(
+    couple_id, pid, partner_id, sex,
+    baseline_year, event_year,
+    couple_cohabit, couple_cohabit_end,
+    rel_duration,
+    cid, hid, life_sat
+  )
+
+assert_unique(parent_sample, c("couple_id", "pid"), "parent_sample")
+stopifnot(nrow(parent_sample) == 2 * n_distinct(parent_sample$couple_id))
+stopifnot(!any(is.na(parent_sample$life_sat)))
+
+cat("\n--- PARENT MULTI-GROUP SAMPLE ---\n")
+cat("Couples:", n_distinct(parent_sample$couple_id), "\n")
+cat("People:", n_distinct(parent_sample$pid), "\n")
+cat("Baseline LS missing:", sum(is.na(parent_sample$life_sat)), "\n")
+
+parent_support <- parent_sample %>%
+  distinct(couple_id, rel_duration)
+
+cat("\nParent relationship duration at signal 0:\n")
+print(as.data.frame(
+  parent_support %>%
+    count(rel_duration) %>%
+    arrange(rel_duration) %>%
+    mutate(
+      pct = 100 * n / sum(n),
+      cumulative_pct = cumsum(pct)
+    )
+))
+
+cat("\nParents with signal-0 relationship duration 0-5:",
+    sum(between(parent_support$rel_duration, 0, 5)),
+    "of", nrow(parent_support),
+    sprintf("(%.1f%%)\n",
+            100 * mean(between(parent_support$rel_duration, 0, 5))))
+
+cat("Parents with signal-0 relationship duration >5:",
+    sum(parent_support$rel_duration > 5), "\n")
+
+stopifnot(all(parent_support$rel_duration >= 0))
+```
+
+```{r nonparent-positive-childless}
+childless_ids <- biobirth %>%
+  transmute(
+    pid,
+    sumkids = as.numeric(sumkids),
+    first_birth_raw = as.numeric(kidgeb01)
+  ) %>%
+  filter(
+    sumkids == 0,
+    !(first_birth_raw > 0)
+  ) %>%
+  distinct(pid)
+
+cat("\nBIOBIRTH respondents positively recorded as childless:",
+    nrow(childless_ids), "\n")
+
+childless_links <- partner_data %>%
+  semi_join(childless_ids, by = "pid") %>%
+  semi_join(childless_ids, by = c("partner_id" = "pid"))
+
+childless_verified <- childless_links %>%
+  inner_join(
+    relationship_episodes,
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    syear >= cohabit_start,
+    syear <= cohabit_end
+  ) %>%
+  mutate(
+    couple_id = paste0(
+      pmin(pid, partner_id),
+      "_",
+      pmax(pid, partner_id)
+    )
+  )
+
+assert_unique(
+  childless_verified,
+  c("pid", "syear"),
+  "childless_verified"
+)
+
+childless_members_raw <- childless_verified %>%
+  distinct(couple_id, pid, partner_id)
+
+valid_childless_pairs <- childless_members_raw %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_partner_ids = n_distinct(partner_id),
+    reciprocal = setequal(unique(pid), unique(partner_id)),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_members == 2,
+    n_partner_ids == 2,
+    reciprocal
+  ) %>%
+  select(couple_id)
+
+childless_members <- childless_members_raw %>%
+  semi_join(valid_childless_pairs, by = "couple_id")
+
+cat("Reciprocal exact-partner childless couples:",
+    n_distinct(childless_members$couple_id), "\n")
+```
+
+```{r nonparent-sex-and-common-episodes}
+# -------------------------------------------------------------------------
+# SEX + HETEROSEXUAL DYAD REQUIREMENT
+# -------------------------------------------------------------------------
+
+sex_data <- ppathl %>%
+  transmute(
+    pid,
+    sex = case_when(
+      sex %in% c(1, 2) ~ as.numeric(sex),
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  distinct(pid, .keep_all = TRUE)
+
+childless_members <- childless_members %>%
+  left_join(
+    sex_data,
+    by = "pid"
+  )
+
+hetero_childless_ids <- childless_members %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_male = sum(sex == 1, na.rm = TRUE),
+    n_female = sum(sex == 2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_members == 2,
+    n_male == 1,
+    n_female == 1
+  ) %>%
+  select(couple_id)
+
+childless_members <- childless_members %>%
+  semi_join(
+    hetero_childless_ids,
+    by = "couple_id"
+  )
+
+cat(
+  "Heterosexual reciprocal childless couples:",
+  n_distinct(childless_members$couple_id),
+  "\n"
+)
+
+stopifnot(
+  n_distinct(childless_members$couple_id) > 0
+)
+
+# -------------------------------------------------------------------------
+# COMMON EXACT RELATIONSHIP EPISODE REPORTED BY BOTH PARTNERS
+# -------------------------------------------------------------------------
+
+episode_side_a <- childless_members %>%
+  distinct(
+    couple_id,
+    pid,
+    partner_id
+  ) %>%
+  inner_join(
+    relationship_episodes %>%
+      select(
+        pid,
+        partner_id,
+        cohabit_start,
+        cohabit_end
+      ),
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(pid < partner_id) %>%
+  transmute(
+    couple_id,
+    pid_low = pid,
+    pid_high = partner_id,
+    start_a = cohabit_start,
+    end_a = cohabit_end
+  )
+
+episode_side_b <- childless_members %>%
+  distinct(
+    couple_id,
+    pid,
+    partner_id
+  ) %>%
+  inner_join(
+    relationship_episodes %>%
+      select(
+        pid,
+        partner_id,
+        cohabit_start,
+        cohabit_end
+      ),
+    by = c("pid", "partner_id"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(pid > partner_id) %>%
+  transmute(
+    couple_id,
+    pid_low = partner_id,
+    pid_high = pid,
+    start_b = cohabit_start,
+    end_b = cohabit_end
+  )
+
+# Intersection of the two partners' recorded episodes.
+childless_common_raw <- episode_side_a %>%
+  inner_join(
+    episode_side_b,
+    by = c(
+      "couple_id",
+      "pid_low",
+      "pid_high"
+    ),
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    common_start = pmax(start_a, start_b),
+    common_end = pmin(end_a, end_b)
+  ) %>%
+  filter(
+    !is.na(common_start),
+    !is.na(common_end),
+    common_end >= common_start
+  ) %>%
+  distinct(
+    couple_id,
+    pid_low,
+    pid_high,
+    common_start,
+    common_end
+  )
+
+cat("\n--- RECIPROCAL RELATIONSHIP EPISODE CHECK ---\n")
+cat("Low-PID episode rows:", nrow(episode_side_a), "\n")
+cat("High-PID episode rows:", nrow(episode_side_b), "\n")
+cat("Overlapping reciprocal episode rows:", nrow(childless_common_raw), "\n")
+cat(
+  "Couples with >=1 reciprocal overlapping episode:",
+  n_distinct(childless_common_raw$couple_id),
+  "\n"
+)
+
+stopifnot(
+  n_distinct(childless_common_raw$couple_id) > 0
+)
+
+# Collapse overlapping/adjacent common intervals for the same exact couple.
+childless_common_intervals <- childless_common_raw %>%
+  arrange(
+    couple_id,
+    common_start,
+    common_end
+  ) %>%
+  group_by(couple_id) %>%
+  mutate(
+    previous_max_end = lag(cummax(common_end)),
+    new_episode = if_else(
+      row_number() == 1L |
+        common_start > previous_max_end + 1,
+      1L,
+      0L
+    ),
+    common_episode_id = cumsum(new_episode)
+  ) %>%
+  group_by(
+    couple_id,
+    common_episode_id
+  ) %>%
+  summarise(
+    couple_cohabit = min(common_start),
+    couple_cohabit_end = max(common_end),
+    .groups = "drop"
+  )
+
+cat(
+  "\nHeterosexual childless couples with common exact-partner episode:",
+  n_distinct(childless_common_intervals$couple_id),
+  "\n"
+)
+
+stopifnot(
+  n_distinct(childless_common_intervals$couple_id) > 0
+)
+
+# Eight annual positions (signals 0-7) span seven calendar-year differences.
+childless_interval_check <- childless_common_intervals %>%
+  mutate(
+    relationship_span = couple_cohabit_end - couple_cohabit
+  )
+
+cat("\n--- CHILDLESS RELATIONSHIP SPAN ---\n")
+print(
+  childless_interval_check %>%
+    summarise(
+      episodes = n(),
+      span_at_least_7 = sum(relationship_span >= 7),
+      pct_span_at_least_7 = 100 * mean(relationship_span >= 7),
+      span_at_least_8 = sum(relationship_span >= 8),
+      median_span = median(relationship_span),
+      max_span = max(relationship_span)
+    )
+)
+```
+
+```{r nonparent-baseline-candidates}
+childless_baseline_candidates <- tidyr::crossing(
+  childless_common_intervals,
+  baseline_offset = BASELINE_OFFSETS
+) %>%
+  mutate(
+    baseline_year = couple_cohabit + baseline_offset,
+    event_year = baseline_year + 3L,
+    window_start = baseline_year,
+    window_end = baseline_year + 7L
+  ) %>%
+  filter(
+    window_end <= couple_cohabit_end,
+    window_start >= DATA_FIRST_YEAR,
+    window_end <= DATA_LAST_YEAR
+  )
+
+cat("\nChildless couples with >=1 structurally valid 0-5 baseline:",
+    n_distinct(childless_baseline_candidates$couple_id), "\n")
+
+stopifnot(
+  n_distinct(childless_baseline_candidates$couple_id) > 0
+)
+
+candidate_window_rows <- childless_baseline_candidates %>%
+  inner_join(
+    childless_members %>%
+      select(couple_id, pid, partner_id, sex),
+    by = "couple_id",
+    relationship = "many-to-many"
+  ) %>%
+  tidyr::uncount(weights = 8, .id = "signal") %>%
+  mutate(
+    signal = signal - 1L,
+    syear = baseline_year + signal
+  ) %>%
+  left_join(
+    partner_link_all,
+    by = c("pid", "syear")
+  ) %>%
+  left_join(
+    annual_hid,
+    by = c("pid", "syear")
+  )
+
+# Evaluate partner constancy and co-residence separately within each signal year.
+# Different HIDs across different years are fine; the exclusion is triggered
+# only if both partners have observed HIDs in the SAME year and those HIDs differ.
+candidate_year_check <- candidate_window_rows %>%
+  group_by(
+    couple_id,
+    common_episode_id,
+    couple_cohabit,
+    couple_cohabit_end,
+    baseline_offset,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end,
+    signal,
+    syear
+  ) %>%
+  summarise(
+    n_members = n_distinct(pid),
+
+    any_conflicting_partner = any(
+      !is.na(partner_id_obs) &
+        partner_id_obs != partner_id
+    ),
+
+    n_hid_observed = sum(!is.na(hid_pgen)),
+    n_distinct_hid = n_distinct(hid_pgen, na.rm = TRUE),
+
+    observed_hid_mismatch =
+      n_members == 2 &
+      n_hid_observed == 2 &
+      n_distinct_hid > 1,
+
+    .groups = "drop"
+  )
+
+cat("\nCandidate control signal-years with observed HID mismatch:",
+    sum(candidate_year_check$observed_hid_mismatch), "\n")
+
+valid_childless_baselines <- candidate_year_check %>%
+  group_by(
+    couple_id,
+    common_episode_id,
+    couple_cohabit,
+    couple_cohabit_end,
+    baseline_offset,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end
+  ) %>%
+  summarise(
+    all_years_two_members = all(n_members == 2),
+    any_conflicting_partner = any(any_conflicting_partner),
+    any_hid_mismatch = any(observed_hid_mismatch),
+    .groups = "drop"
+  ) %>%
+  filter(
+    all_years_two_members,
+    !any_conflicting_partner,
+    !any_hid_mismatch
+  ) %>%
+  select(
+    couple_id,
+    couple_cohabit,
+    couple_cohabit_end,
+    baseline_offset,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end
+  )
+
+cat(
+  "Childless couples with >=1 baseline passing full-window partner + HID check:",
+  n_distinct(valid_childless_baselines$couple_id),
+  "\n"
+)
+
+stopifnot(
+  n_distinct(valid_childless_baselines$couple_id) > 0
+)
+
+# -------------------------------------------------------------------------
+# REQUIRE BOTH PARTNERS TO HAVE SIGNAL-0 / BASELINE LIFE SATISFACTION
+# -------------------------------------------------------------------------
+# Check LS availability for EACH structurally valid candidate baseline before
+# sampling the final baseline. This avoids choosing a missing baseline first
+# and then excluding the couple afterward.
+
+control_baseline_ls_check <- valid_childless_baselines %>%
+  inner_join(
+    childless_members %>%
+      select(couple_id, pid),
+    by = "couple_id",
+    relationship = "many-to-many"
+  ) %>%
+  left_join(
+    swb %>%
+      select(pid, syear, life_sat),
+    by = c("pid", "baseline_year" = "syear")
+  ) %>%
+  group_by(
+    couple_id,
+    couple_cohabit,
+    couple_cohabit_end,
+    baseline_offset,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end
+  ) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    both_baseline_ls = sum(!is.na(life_sat)) == 2,
+    .groups = "drop"
+  )
+
+valid_childless_baselines_ls <- control_baseline_ls_check %>%
+  filter(
+    n_members == 2,
+    both_baseline_ls
+  ) %>%
+  select(
+    couple_id,
+    couple_cohabit,
+    couple_cohabit_end,
+    baseline_offset,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end
+  )
+
+cat(
+  "Childless couples with >=1 valid baseline where both partners have LS:",
+  n_distinct(valid_childless_baselines_ls$couple_id),
+  "\n"
+)
+
+stopifnot(
+  n_distinct(valid_childless_baselines_ls$couple_id) > 0
+)
+
+# -------------------------------------------------------------------------
+# ENSURE EACH PERSON CONTRIBUTES TO ONLY ONE CHILDLESS DYAD
+# -------------------------------------------------------------------------
+# A small number of respondents can have multiple qualifying relationships
+# at different periods of the panel. Randomly retain one eligible relationship
+# for each multiply represented person.
+
+eligible_childless_members <- childless_members %>%
+  semi_join(
+    valid_childless_baselines_ls %>%
+      distinct(couple_id),
+    by = "couple_id"
+  ) %>%
+  distinct(
+    couple_id,
+    pid
+  )
+
+duplicate_childless_pids <- eligible_childless_members %>%
+  count(pid) %>%
+  filter(n > 1)
+
+cat(
+  "\nPeople belonging to >1 eligible childless couple:",
+  nrow(duplicate_childless_pids),
+  "\n"
+)
+
+if (nrow(duplicate_childless_pids) > 0) {
+
+  conflict_memberships <- eligible_childless_members %>%
+    semi_join(
+      duplicate_childless_pids,
+      by = "pid"
+    )
+
+  print(
+    as.data.frame(
+      conflict_memberships %>%
+        arrange(pid, couple_id)
+    )
+  )
+
+  # In the current data, each contested couple contains only one person who
+  # appears in multiple qualifying dyads. Fail loudly if that changes.
+  conflict_structure <- conflict_memberships %>%
+    count(couple_id)
+
+  stopifnot(
+    all(conflict_structure$n == 1)
+  )
+
+  # Separate seed from the pseudo-baseline draw below.
+  set.seed(RANDOM_SEED + 1L)
+
+  chosen_conflict_couples <- conflict_memberships %>%
+    group_by(pid) %>%
+    slice_sample(n = 1) %>%
+    ungroup() %>%
+    distinct(couple_id)
+
+  all_conflict_couples <- conflict_memberships %>%
+    distinct(couple_id)
+
+  # Keep all uncontested couples plus one randomly selected relationship for
+  # each multiply represented person.
+  valid_childless_baselines_unique <- bind_rows(
+    valid_childless_baselines_ls %>%
+      anti_join(
+        all_conflict_couples,
+        by = "couple_id"
+      ),
+
+    valid_childless_baselines_ls %>%
+      semi_join(
+        chosen_conflict_couples,
+        by = "couple_id"
+      )
+  )
+
+} else {
+
+  valid_childless_baselines_unique <- valid_childless_baselines_ls
+}
+
+# Confirm that every person now appears in only one retained eligible dyad.
+unique_childless_members <- childless_members %>%
+  semi_join(
+    valid_childless_baselines_unique %>%
+      distinct(couple_id),
+    by = "couple_id"
+  ) %>%
+  distinct(
+    couple_id,
+    pid
+  )
+
+stopifnot(
+  !anyDuplicated(unique_childless_members$pid)
+)
+
+cat(
+  "Eligible childless couples after person-level de-duplication:",
+  n_distinct(valid_childless_baselines_unique$couple_id),
+  "\n"
+)
+
+set.seed(RANDOM_SEED)
+
+childless_anchor <- valid_childless_baselines_unique %>%
+  group_by(couple_id) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  mutate(
+    group = 0L,
+    rel_duration = baseline_year - couple_cohabit
+  )
+
+assert_unique(childless_anchor, "couple_id", "childless_anchor")
+
+cat("\nSelected childless signal-0 baseline offsets:\n")
+print(as.data.frame(
+  childless_anchor %>%
+    count(baseline_offset) %>%
+    mutate(pct = 100 * n / sum(n)) %>%
+    arrange(baseline_offset)
+))
+```
+
+```{r nonparent-window}
+childless <- childless_anchor %>%
+  select(
+    couple_id,
+    baseline_year,
+    event_year,
+    window_start,
+    window_end,
+    couple_cohabit,
+    couple_cohabit_end,
+    rel_duration,
+    group
+  ) %>%
+  inner_join(
+    childless_members %>%
+      select(couple_id, pid, partner_id, sex),
+    by = "couple_id",
+    relationship = "many-to-many"
+  ) %>%
+  tidyr::uncount(weights = 8, .id = "signal") %>%
+  mutate(
+    signal = signal - 1L,
+    syear = baseline_year + signal
+  ) %>%
+  left_join(
+    swb %>%
+      select(pid, syear, cid, hid, life_sat),
+    by = c("pid", "syear")
+  )
+
+assert_unique(
+  childless,
+  c("couple_id", "pid", "signal"),
+  "childless"
+)
+
+# Final control-window sanity check for the selected pseudo-event windows.
+childless_hid_check <- childless %>%
+  distinct(couple_id, pid, signal, syear) %>%
+  left_join(
+    annual_hid,
+    by = c("pid", "syear")
+  ) %>%
+  group_by(couple_id, signal, syear) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_hid_observed = sum(!is.na(hid_pgen)),
+    n_distinct_hid = n_distinct(hid_pgen, na.rm = TRUE),
+    observed_hid_mismatch =
+      n_members == 2 &
+      n_hid_observed == 2 &
+      n_distinct_hid > 1,
+    .groups = "drop"
+  )
+
+stopifnot(!any(childless_hid_check$observed_hid_mismatch))
+
+childless_sample <- childless %>%
+  filter(signal == 0) %>%
+  select(
+    couple_id, pid, partner_id, sex,
+    baseline_year, event_year,
+    couple_cohabit, couple_cohabit_end,
+    rel_duration,
+    cid, hid, life_sat
+  )
+
+assert_unique(
+  childless_sample,
+  c("couple_id", "pid"),
+  "childless_sample"
+)
+
+stopifnot(!any(is.na(childless_sample$life_sat)))
+
+cat("\n--- NON-PARENTING MULTI-GROUP SAMPLE ---\n")
+cat("Couples:", n_distinct(childless_sample$couple_id), "\n")
+cat("People:", n_distinct(childless_sample$pid), "\n")
+cat("Baseline LS missing:", sum(is.na(childless_sample$life_sat)), "\n")
+
+childless_outcome_coverage <- childless %>%
+  group_by(couple_id, pid) %>%
+  summarise(
+    n_ls = sum(!is.na(life_sat)),
+    .groups = "drop"
+  )
+
+cat("People with zero observed LS values across signals 0-7:",
+    sum(childless_outcome_coverage$n_ls == 0), "\n")
+cat("Couples with >=1 partner having zero LS values:",
+    childless_outcome_coverage %>%
+      group_by(couple_id) %>%
+      summarise(any_zero = any(n_ls == 0), .groups = "drop") %>%
+      summarise(n = sum(any_zero)) %>%
+      pull(n),
+    "\n")
+```
+
+```{r baseline-identifiers}
+baseline_ids <- pgen %>%
+  transmute(
+    pid,
+    syear,
+    cid_pgen = as.numeric(cid),
+    hid_pgen = as.numeric(hid)
+  )
+
+fill_baseline_ids <- function(data) {
+  data %>%
+    mutate(
+      cid = as.numeric(cid),
+      hid = as.numeric(hid)
+    ) %>%
+    left_join(
+      baseline_ids,
+      by = c("pid", "baseline_year" = "syear")
+    ) %>%
+    mutate(
+      cid = coalesce(cid, cid_pgen),
+      hid = coalesce(hid, hid_pgen)
+    ) %>%
+    select(-cid_pgen, -hid_pgen)
+}
+
+parent_sample <- fill_baseline_ids(parent_sample)
+childless_sample <- fill_baseline_ids(childless_sample)
+```
+
+```{r sanity-checks}
+cat("\n=== PARENT MULTI-GROUP SAMPLE ===\n")
+cat("Couples:", n_distinct(parent_sample$couple_id), "\n")
+cat("Individuals:", n_distinct(parent_sample$pid), "\n")
+cat("Baseline year range:",
+    min(parent_sample$baseline_year),
+    "to",
+    max(parent_sample$baseline_year), "\n")
+
+cat("\n=== NON-PARENTING SAMPLE ===\n")
+cat("Couples:", n_distinct(childless_sample$couple_id), "\n")
+cat("Individuals:", n_distinct(childless_sample$pid), "\n")
+cat("Baseline year range:",
+    min(childless_sample$baseline_year),
+    "to",
+    max(childless_sample$baseline_year), "\n")
+
+parent_member_check <- parent_sample %>%
+  group_by(couple_id) %>%
+  summarise(
+    n = n_distinct(pid),
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+
+childless_member_check <- childless_sample %>%
+  group_by(couple_id) %>%
+  summarise(
+    n = n_distinct(pid),
+    n_male = sum(sex == 1),
+    n_female = sum(sex == 2),
+    .groups = "drop"
+  )
+
+stopifnot(all(parent_member_check$n == 2))
+stopifnot(all(parent_member_check$n_male == 1 & parent_member_check$n_female == 1))
+
+stopifnot(all(childless_member_check$n == 2))
+stopifnot(all(childless_member_check$n_male == 1 & childless_member_check$n_female == 1))
+
+cat("\n=== CROSS-SAMPLE ===\n")
+cat("PIDs in both samples:",
+    length(intersect(parent_sample$pid, childless_sample$pid)), "\n")
+cat("Couple IDs in both samples:",
+    length(intersect(parent_sample$couple_id, childless_sample$couple_id)), "\n")
+
+stopifnot(
+  length(intersect(parent_sample$pid, childless_sample$pid)) == 0
+)
+
+stopifnot(all(childless_anchor$event_year == childless_anchor$baseline_year + 3L))
+
+stopifnot(all(parent %>% filter(signal == 0) %>% pull(syear) ==
+                parent %>% filter(signal == 0) %>% pull(baseline_year)))
+stopifnot(all(childless %>% filter(signal == 0) %>% pull(syear) ==
+                childless %>% filter(signal == 0) %>% pull(baseline_year)))
+```
+
+```{r combine-baseline}
+parent_baseline_df <- parent_sample %>%
+  mutate(group = 1L) %>%
+  transmute(
+    pid,
+    couple_id,
+    syear = baseline_year,
+    cid,
+    hid,
+    sex,
+    life_sat,
+    couple_cohabit,
+    rel_duration,
+    group
+  )
+
+childless_baseline_df <- childless_sample %>%
+  mutate(group = 0L) %>%
+  transmute(
+    pid,
+    couple_id,
+    syear = baseline_year,
+    cid,
+    hid,
+    sex,
+    life_sat,
+    couple_cohabit,
+    rel_duration,
+    group
+  )
+
+ipw_sample <- bind_rows(
+  parent_baseline_df,
+  childless_baseline_df
+)
+
+assert_unique(ipw_sample, "pid", "ipw_sample")
+
+cat("\n--- COMBINED IPW BASELINE SAMPLE ---\n")
+cat("Total couples:", n_distinct(ipw_sample$couple_id), "\n")
+cat("Parent couples:",
+    n_distinct(ipw_sample$couple_id[ipw_sample$group == 1]), "\n")
+cat("Non-parenting couples:",
+    n_distinct(ipw_sample$couple_id[ipw_sample$group == 0]), "\n")
+cat("Duplicate PIDs:", sum(duplicated(ipw_sample$pid)), "\n")
+
+cat("\nRelationship-duration support at signal 0:\n")
+print(as.data.frame(
+  ipw_sample %>%
+    distinct(couple_id, group, rel_duration) %>%
+    count(group, rel_duration) %>%
+    arrange(group, rel_duration)
+))
+
+cat("\nNOTE: parents above rel_duration 5 are retained here.\n")
+cat("Propensity-score/common-support diagnostics should determine whether\n")
+cat("a later support restriction or sensitivity analysis is necessary.\n")
+```
+
+```{r covariates}
+age_bioedu <- bioedu %>%
+  transmute(
+    pid,
+    birth_yr = if_else(
+      gebjahr > 0,
+      as.numeric(gebjahr),
+      NA_real_
+    )
+  ) %>%
+  filter(!is.na(birth_yr)) %>%
+  distinct(pid, .keep_all = TRUE)
+
+age_ppathl <- ppathl %>%
+  transmute(
+    pid,
+    birth_yr_p = if_else(
+      gebjahr > 0,
+      as.numeric(gebjahr),
+      NA_real_
+    )
+  ) %>%
+  filter(!is.na(birth_yr_p)) %>%
+  distinct(pid, .keep_all = TRUE)
+
+ipw_sample <- ipw_sample %>%
+  left_join(age_bioedu, by = "pid") %>%
+  left_join(age_ppathl, by = "pid") %>%
+  mutate(
+    birth_yr = coalesce(birth_yr, birth_yr_p),
+    age = syear - birth_yr
+  ) %>%
+  select(-birth_yr, -birth_yr_p)
+
+citizen <- ppathl %>%
+  transmute(
+    pid,
+    germborn_raw = as.numeric(germborn),
+    migration_raw = as.numeric(migback)
+  ) %>%
+  mutate(
+    germborn = case_when(
+      germborn_raw < 0 ~ NA_real_,
+      germborn_raw == 1 ~ 1,
+      TRUE ~ 0
+    ),
+    migration = case_when(
+      migration_raw < 0 ~ NA_real_,
+      migration_raw %in% c(2, 3) ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  select(pid, germborn, migration) %>%
+  distinct(pid, .keep_all = TRUE)
+
+ipw_sample <- ipw_sample %>%
+  left_join(citizen, by = "pid")
+
+nation <- pgen %>%
+  transmute(
+    pid,
+    syear,
+    germcitz_raw = as.numeric(pgnation)
+  ) %>%
+  mutate(
+    germcitz = case_when(
+      germcitz_raw < 0 ~ NA_real_,
+      germcitz_raw == 1 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  select(pid, syear, germcitz)
+
+ipw_sample <- ipw_sample %>%
+  left_join(nation, by = c("pid", "syear"))
+
+# -------------------------------------------------------------------------
+# LONGITUDINAL BACKFILL FOR TWO ISOLATED BASELINE CITIZENSHIP VALUES
+# -------------------------------------------------------------------------
+# These are not model-based imputations. At the baseline/IPW year, pgnation
+# is a nonresponse code for exactly two people. Their subsequent repeated
+# nationality reports are concordant:
+#   PID 5138502: 1994-1995 missing; 1996-1997 pgnation = 79 -> non-German (0)
+#   PID 5601802: 1995 missing;      1996-1998 pgnation = 1  -> German (1)
+# We therefore recover the baseline binary citizenship value from the
+# respondent's own longitudinal record before multiple imputation.
+
+citizenship_backfill <- tibble::tribble(
+  ~pid,     ~syear, ~germcitz_fill,
+  5138502,   1994,       0,
+  5601802,   1995,       1
+)
+
+# Guard against accidentally overwriting an observed baseline value.
+backfill_precheck <- ipw_sample %>%
+  semi_join(citizenship_backfill, by = c("pid", "syear")) %>%
+  select(pid, syear, germcitz)
+
+stopifnot(
+  nrow(backfill_precheck) == 2,
+  all(is.na(backfill_precheck$germcitz))
+)
+
+ipw_sample <- ipw_sample %>%
+  left_join(citizenship_backfill, by = c("pid", "syear")) %>%
+  mutate(
+    germcitz = coalesce(germcitz, germcitz_fill)
+  ) %>%
+  select(-germcitz_fill)
+
+cat("\nCitizenship longitudinal backfill check:\n")
+print(
+  ipw_sample %>%
+    filter(pid %in% c(5138502, 5601802)) %>%
+    select(couple_id, group, sex, pid, syear, germborn, migration, germcitz)
+)
+cat("Remaining missing germcitz values:", sum(is.na(ipw_sample$germcitz)), "\n")
+stopifnot(sum(is.na(ipw_sample$germcitz)) == 0)
+
+employment <- pgen %>%
+  transmute(
+    pid,
+    syear,
+    employment_raw = as.numeric(pgemplst)
+  ) %>%
+  mutate(
+    employment = case_when(
+      employment_raw < 0 ~ NA_real_,
+      employment_raw == 1 ~ 1,
+      employment_raw == 2 ~ 2,
+      employment_raw == 5 ~ 3,
+      employment_raw %in% c(3, 4, 6, 7) ~ 4,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(pid, syear, employment)
+
+ipw_sample <- ipw_sample %>%
+  left_join(employment, by = c("pid", "syear"))
+
+education <- pgen %>%
+  transmute(
+    pid,
+    syear,
+    edu_raw = as.numeric(pgcasmin)
+  ) %>%
+  mutate(
+    edu_level = case_when(
+      edu_raw < 0 ~ NA_real_,
+      edu_raw %in% c(0, 1, 2, 3) ~ 1,
+      edu_raw %in% c(4, 5) ~ 2,
+      edu_raw %in% c(6, 7) ~ 3,
+      edu_raw %in% c(8, 9) ~ 4,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(pid, syear, edu_level)
+
+ipw_sample <- ipw_sample %>%
+  left_join(education, by = c("pid", "syear"))
+
+cat("\nRaw hgnuts1_ew values:\n")
+print(table(hgen$hgnuts1_ew, useNA = "ifany"))
+
+household <- hgen %>%
+  transmute(
+    cid = as.numeric(cid),
+    hid = as.numeric(hid),
+    syear,
+    hinc_raw = as.numeric(hghinc),
+    hgowner_raw = as.numeric(hgowner),
+    size_raw = as.numeric(hgsize),
+    hgseval_raw = as.numeric(hgseval),
+    move_year_raw = as.numeric(hgmoveyr),
+    east_raw = as.numeric(hgnuts1_ew)
+  ) %>%
+  mutate(
+    hinc = if_else(hinc_raw >= 0, hinc_raw, NA_real_),
+    size = if_else(size_raw >= 0, size_raw, NA_real_),
+    hgowner = case_when(
+      hgowner_raw < 0 ~ NA_real_,
+      hgowner_raw == 1 ~ 1,
+      TRUE ~ 0
+    ),
+    smallspace = case_when(
+      hgseval_raw < 0 ~ NA_real_,
+      hgseval_raw %in% c(1, 2) ~ 1,
+      TRUE ~ 0
+    ),
+    livedhere = case_when(
+      move_year_raw > 0 & move_year_raw <= syear ~ syear - move_year_raw,
+      TRUE ~ NA_real_
+    ),
+    east = case_when(
+      east_raw < 0 ~ NA_real_,
+      east_raw == 22 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  select(
+    cid, hid, syear,
+    hinc, hgowner, size,
+    smallspace, livedhere, east
+  )
+
+assert_unique(
+  household,
+  c("cid", "hid", "syear"),
+  "household"
+)
+
+ipw_sample <- ipw_sample %>%
+  mutate(
+    cid = as.numeric(cid),
+    hid = as.numeric(hid)
+  ) %>%
+  left_join(
+    household,
+    by = c("cid", "hid", "syear")
+  )
+
+household_size <- hbrutto %>%
+  transmute(
+    cid = as.numeric(cid),
+    hid = as.numeric(hid),
+    syear,
+    hhgr = case_when(
+      as.numeric(hhgr) < 0 ~ NA_real_,
+      TRUE ~ as.numeric(hhgr)
+    )
+  )
+
+assert_unique(
+  household_size,
+  c("cid", "hid", "syear"),
+  "household_size"
+)
+
+ipw_sample <- ipw_sample %>%
+  left_join(
+    household_size,
+    by = c("cid", "hid", "syear")
+  )
+```
+
+```{r covariate-diagnostics}
+hh_check <- ipw_sample %>%
+  group_by(couple_id) %>%
+  summarise(
+    n_members = n_distinct(pid),
+    n_nonmissing_hid = sum(!is.na(hid)),
+    n_distinct_hid = n_distinct(hid, na.rm = TRUE),
+    both_same_hh =
+      n_members == 2 &
+      n_nonmissing_hid == 2 &
+      n_distinct_hid == 1,
+    .groups = "drop"
+  )
+
+cat("\nCouples whose two baseline HIDs are both observed and identical:",
+    sum(hh_check$both_same_hh), "of", nrow(hh_check), "\n")
+cat("Couples failing that diagnostic:",
+    sum(!hh_check$both_same_hh), "\n")
+
+cat("\nMissingness per IPW variable (person level):\n")
+
+ipw_sample %>%
+  summarise(
+    across(
+      c(
+        life_sat,
+        age, germcitz, germborn, migration,
+        employment, edu_level,
+        hinc, hgowner, size, smallspace,
+        livedhere, east, hhgr,
+        rel_duration, syear
+      ),
+      ~ sum(is.na(.))
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  arrange(desc(n_missing)) %>%
+  print(n = Inf)
+
+cat("\nEmployment categories:\n")
+print(table(ipw_sample$employment, useNA = "ifany"))
+
+cat("\nEducation categories:\n")
+print(table(ipw_sample$edu_level, useNA = "ifany"))
+
+cat("\nHomeownership:\n")
+print(table(ipw_sample$hgowner, useNA = "ifany"))
+
+cat("\nEast/West indicator:\n")
+print(table(ipw_sample$east, useNA = "ifany"))
+```
+
+```{r save-03}
+dir.create(
+  here("data", "derived"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+saveRDS(
+  haven::zap_labels(parent),
+  here("data", "derived", "parent.rds")
+)
+
+saveRDS(
+  haven::zap_labels(parent_sample),
+  here("data", "derived", "parent_sample.rds")
+)
+
+saveRDS(
+  haven::zap_labels(childless),
+  here("data", "derived", "childless.rds")
+)
+
+saveRDS(
+  haven::zap_labels(childless_sample),
+  here("data", "derived", "childless_sample.rds")
+)
+
+saveRDS(
+  haven::zap_labels(childless_anchor),
+  here("data", "derived", "childless_anchor.rds")
+)
+
+saveRDS(
+  haven::zap_labels(ipw_sample),
+  here("data", "derived", "ipw_sample.rds")
+)
+
+cat("\nSaved rebuilt 03 outputs to data/derived/\n")
+
+cat("\n--- FINAL 03 SUMMARY ---\n")
+cat("Parent multi-group couples:",
+    n_distinct(parent_sample$couple_id), "\n")
+cat("Non-parenting couples:",
+    n_distinct(childless_sample$couple_id), "\n")
+cat("Combined IPW couples:",
+    n_distinct(ipw_sample$couple_id), "\n")
+cat("Combined IPW people:",
+    n_distinct(ipw_sample$pid), "\n")
+```

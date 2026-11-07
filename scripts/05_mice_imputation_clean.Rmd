@@ -1,0 +1,301 @@
+---
+title: "05 MICE Imputation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+library(mice)
+
+options(scipen = 999)
+
+# Final MICE imputation run for baseline propensity-score covariates.
+# No clipping, truncation, or rounding is performed.
+
+INPUT_PATH <- here("data", "derived", "ipw_wide.rds")
+OUTPUT_DIR <- here("data", "derived")
+
+M <- 20L
+MAXIT <- 20L
+SEED <- 424
+
+stopifnot(file.exists(INPUT_PATH))
+
+dat_raw <- readRDS(INPUT_PATH)
+
+cat("Input dimensions:", nrow(dat_raw), "x", ncol(dat_raw), "\n")
+cat("Unique couples:", n_distinct(dat_raw$couple_id), "\n")
+
+stopifnot(
+  nrow(dat_raw) == 1602,
+  n_distinct(dat_raw$couple_id) == 1602
+)
+```
+
+## 1. Pre-imputation missingness
+
+```{r}
+missingness <- tibble(
+  variable = names(dat_raw),
+  n_missing = map_int(dat_raw, ~ sum(is.na(.x)))
+) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+print(missingness)
+
+expected_incomplete <- c(
+  "hinc",
+  "hgowner",
+  "smallspace",
+  "livedhere",
+  "east",
+  "M_edu_level",
+  "F_edu_level"
+)
+
+unexpected_incomplete <- setdiff(
+  missingness$variable,
+  expected_incomplete
+)
+
+if (length(unexpected_incomplete) > 0) {
+  stop(
+    "Unexpected incomplete variables: ",
+    paste(unexpected_incomplete, collapse = ", ")
+  )
+}
+
+missing_expected_but_absent <- setdiff(
+  expected_incomplete,
+  missingness$variable
+)
+
+if (length(missing_expected_but_absent) > 0) {
+  stop(
+    "Expected incomplete variables are no longer missing: ",
+    paste(missing_expected_but_absent, collapse = ", ")
+  )
+}
+
+cat("PASS: missingness occurs only in the expected variables.\n")
+```
+
+## 2. Prepare variable types
+
+```{r}
+dat <- dat_raw %>%
+  mutate(
+    hgowner = factor(hgowner, levels = c(0, 1)),
+    smallspace = factor(smallspace, levels = c(0, 1)),
+    east = factor(east, levels = c(0, 1)),
+    M_employment = factor(M_employment, levels = 1:4),
+    F_employment = factor(F_employment, levels = 1:4),
+    M_edu_level = ordered(M_edu_level, levels = 1:4),
+    F_edu_level = ordered(F_edu_level, levels = 1:4)
+  )
+```
+
+## 3. Create MICE method vector and predictor matrix
+
+```{r}
+meth <- make.method(dat)
+pred <- make.predictorMatrix(dat)
+```
+
+## 4. Specify imputation methods
+
+```{r}
+meth[] <- ""
+
+meth["hinc"]      <- "pmm"
+meth["livedhere"] <- "pmm"
+
+meth["hgowner"]    <- "logreg"
+meth["smallspace"] <- "logreg"
+meth["east"]       <- "logreg"
+
+meth["M_edu_level"] <- "polr"
+meth["F_edu_level"] <- "polr"
+
+method_table <- tibble(
+  variable = names(meth),
+  method = unname(meth)
+) %>%
+  filter(method != "")
+
+print(method_table)
+
+stopifnot(
+  setequal(
+    names(meth)[meth != ""],
+    expected_incomplete
+  )
+)
+```
+
+## 5. Predictor matrix
+
+```{r}
+pred[,] <- 1
+diag(pred) <- 0
+
+# couple_id is an identifier only and is never used as a predictor.
+pred[, "couple_id"] <- 0
+pred["couple_id", ] <- 0
+
+# Complete variables may predict missing covariates but are not imputed.
+not_imputed <- names(meth)[meth == ""]
+pred[not_imputed, ] <- 0
+
+target_vars <- names(meth)[meth != ""]
+
+print(
+  pred[
+    target_vars,
+    ,
+    drop = FALSE
+  ]
+)
+
+stopifnot(
+  all(pred[, "couple_id"] == 0),
+  all(pred["couple_id", ] == 0)
+)
+```
+
+## 6. Run final MICE imputation
+
+```{r}
+imp <- mice(
+  dat,
+  m = M,
+  maxit = MAXIT,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE,
+  seed = SEED,
+  polr.to.loggedEvents = TRUE
+)
+
+print(imp)
+```
+
+## 7. Logged events
+
+```{r}
+if (is.null(imp$loggedEvents)) {
+  cat("No logged events.\n")
+} else {
+  print(imp$loggedEvents)
+}
+```
+
+## 8. Save final imputation objects
+
+```{r}
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+saveRDS(
+  dat,
+  here("data", "derived", "mice_input_final.rds")
+)
+
+saveRDS(
+  imp,
+  here("data", "derived", "mice_imp_final.rds")
+)
+
+completed_long <- complete(
+  imp,
+  action = "long",
+  include = FALSE
+)
+
+saveRDS(
+  completed_long,
+  here("data", "derived", "mice_completed_long_final.rds")
+)
+```
+
+## 9. Immediate support checks
+
+```{r}
+support_check <- completed_long %>%
+  summarise(
+    min_hinc = min(hinc, na.rm = TRUE),
+    max_hinc = max(hinc, na.rm = TRUE),
+    n_nonpositive_hinc = sum(hinc <= 0, na.rm = TRUE),
+    min_livedhere = min(livedhere, na.rm = TRUE),
+    max_livedhere = max(livedhere, na.rm = TRUE),
+    n_negative_livedhere = sum(livedhere < 0, na.rm = TRUE),
+    n_noninteger_livedhere = sum(
+      abs(livedhere - round(livedhere)) > 1e-8,
+      na.rm = TRUE
+    )
+  )
+
+print(support_check)
+
+stopifnot(
+  support_check$n_nonpositive_hinc == 0,
+  support_check$n_negative_livedhere == 0,
+  support_check$n_noninteger_livedhere == 0
+)
+```
+
+## 10. Final summary
+
+```{r}
+n_logged <- if (
+  is.null(imp$loggedEvents)
+) {
+  0L
+} else {
+  nrow(imp$loggedEvents)
+}
+
+cat("\n====================================\n")
+cat("05 FINAL MICE IMPUTATION SUMMARY\n")
+cat("====================================\n")
+cat("Couples:", nrow(dat), "\n")
+cat("Imputations:", imp$m, "\n")
+cat("Iterations:", imp$iteration, "\n")
+cat("Seed:", SEED, "\n")
+cat("Logged events:", n_logged, "\n")
+cat("Minimum hinc:", min(completed_long$hinc, na.rm = TRUE), "\n")
+cat(
+  "Negative livedhere:",
+  sum(completed_long$livedhere < 0, na.rm = TRUE),
+  "\n"
+)
+cat(
+  "Noninteger livedhere:",
+  sum(
+    abs(completed_long$livedhere - round(completed_long$livedhere)) > 1e-8,
+    na.rm = TRUE
+  ),
+  "\n"
+)
+cat("====================================\n")
+```
+
+## 11. Software version
+
+```{r}
+cat("R version:", R.version.string, "\n")
+cat(
+  "mice version:",
+  as.character(packageVersion("mice")),
+  "\n"
+)
+```

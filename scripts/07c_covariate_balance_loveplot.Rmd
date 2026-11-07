@@ -1,0 +1,278 @@
+---
+title: "Covariate Balance Love Plot"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(cobalt)
+library(ggplot2)
+library(here)
+
+options(scipen = 999)
+```
+
+## 1. Paths
+
+```{r paths}
+INPUT_PATH <- here(
+  "data",
+  "derived",
+  "ebal_att_long.rds"
+)
+
+OUTPUT_DIR <- here(
+  "data",
+  "derived"
+)
+
+stopifnot(file.exists(INPUT_PATH))
+
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+## 2. Load entropy-balanced multiply imputed data
+
+```{r load-data}
+bal_dat <- readRDS(INPUT_PATH)
+
+required_vars <- c(
+  ".imp",
+  "group_w",
+  "att_weight_ebal"
+)
+
+missing_vars <- setdiff(required_vars, names(bal_dat))
+
+if (length(missing_vars) > 0) {
+  stop(
+    "Missing required variables: ",
+    paste(missing_vars, collapse = ", ")
+  )
+}
+
+stopifnot(
+  dplyr::n_distinct(bal_dat$.imp) == 20L,
+  all(is.finite(bal_dat$att_weight_ebal)),
+  all(bal_dat$att_weight_ebal > 0)
+)
+
+cat("Rows:", nrow(bal_dat), "\n")
+cat("Imputations:", dplyr::n_distinct(bal_dat$.imp), "\n")
+```
+
+## 3. Covariate specification
+
+```{r formula}
+ATT_FORMULA <- group_w ~
+  hinc +
+  hgowner +
+  size +
+  smallspace +
+  livedhere +
+  east +
+  hhgr +
+  rel_duration +
+  syear +
+  M_age +
+  M_life_sat +
+  M_germborn +
+  M_migration +
+  M_germcitz +
+  M_employment +
+  M_edu_level +
+  F_age +
+  F_life_sat +
+  F_germborn +
+  F_migration +
+  F_germcitz +
+  F_employment +
+  F_edu_level
+```
+
+## 4. Balance object across the 20 imputations
+
+```{r balance-object}
+bal_mi <- cobalt::bal.tab(
+  ATT_FORMULA,
+  data = bal_dat,
+  weights = "att_weight_ebal",
+  imp = ".imp",
+  un = TRUE,
+  stats = "mean.diffs",
+  s.d.denom = "pooled",
+  continuous = "std",
+  binary = "std",
+  poly = 1,
+  abs = TRUE,
+  quick = FALSE
+)
+
+print(bal_mi)
+```
+
+## 5. Publication labels
+
+```{r labels}
+nice_names <- c(
+  hinc           = "Household income",
+  hgowner        = "Homeownership",
+  size           = "Dwelling size",
+  smallspace     = "Adequacy of living space",
+  livedhere      = "Years at current residence",
+  east           = "East Germany",
+  hhgr           = "Household size",
+  rel_duration   = "Relationship duration",
+  syear          = "Survey year",
+
+  M_age          = "Male partner: Age",
+  M_life_sat     = "Male partner: Baseline life satisfaction",
+  M_germborn     = "Male partner: Born in Germany",
+  M_migration    = "Male partner: Migration background",
+  M_germcitz     = "Male partner: German citizenship",
+  M_employment   = "Male partner: Employment",
+  M_edu_level    = "Male partner: Education",
+
+  F_age          = "Female partner: Age",
+  F_life_sat     = "Female partner: Baseline life satisfaction",
+  F_germborn     = "Female partner: Born in Germany",
+  F_migration    = "Female partner: Migration background",
+  F_germcitz     = "Female partner: German citizenship",
+  F_employment   = "Female partner: Employment",
+  F_edu_level    = "Female partner: Education"
+)
+```
+
+## 6. Main/supplement Love plot
+
+Points represent the mean absolute standardized mean difference across the 20 imputations. Horizontal ranges represent the minimum-to-maximum balance statistic across imputations.
+
+```{r love-plot, fig.width=8, fig.height=9}
+p_balance <- cobalt::love.plot(
+  bal_mi,
+  stats = "mean.diffs",
+  abs = TRUE,
+
+  # Aggregate balance across multiply imputed datasets.
+  which.imp = .none,
+  agg.fun = "range",
+
+  # Conventional balance threshold.
+  thresholds = c(m = 0.10),
+
+  # Order by pre-weighting imbalance.
+  var.order = "unadjusted",
+
+  # Labels.
+  var.names = nice_names,
+  factor_sep = ": ",
+
+  # Styling.
+  line = TRUE,
+  colors = c("grey55", "black"),
+  shapes = c("triangle filled", "circle filled"),
+  sample.names = c(
+    "Before weighting",
+    "After entropy balancing"
+  ),
+  size = 3,
+  wrap = 40,
+  position = "top"
+) +
+  labs(
+    x = "Absolute standardized mean difference",
+    y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "top",
+    legend.justification = "left",
+    legend.text = element_text(size = 10),
+
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"
+    ),
+
+    axis.text.y = element_text(
+      size = 9.2,
+      colour = "black"
+    ),
+
+    axis.title.x = element_text(
+      size = 11,
+      margin = margin(t = 8)
+    ),
+
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+
+    plot.margin = margin(
+      t = 5,
+      r = 12,
+      b = 8,
+      l = 5
+    )
+  )
+
+p_balance
+```
+
+## 7. Save publication files
+
+```{r save-figure}
+PNG_PATH <- here(
+  "data", "derived",
+  "Figure_covariate_balance_entropy_ATT.png"
+)
+
+PDF_PATH <- here(
+  "data", "derived",
+  "Figure_covariate_balance_entropy_ATT.pdf"
+)
+
+ggsave(
+  PNG_PATH,
+  p_balance,
+  width = 8,
+  height = 9,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  PDF_PATH,
+  p_balance,
+  width = 8,
+  height = 9,
+  units = "in"
+)
+
+cat("Saved:\n")
+cat(PNG_PATH, "\n")
+cat(PDF_PATH, "\n")
+```
+
+## 8. Optional balance summary
+
+```{r summary}
+cat("\n====================================\n")
+cat("COVARIATE BALANCE FIGURE COMPLETE\n")
+cat("====================================\n")
+cat("Imputations:", dplyr::n_distinct(bal_dat$.imp), "\n")
+cat("Weight variable: att_weight_ebal\n")
+cat("Balance statistic: absolute SMD\n")
+cat("Threshold: 0.10\n")
+cat("Aggregation across imputations: mean + min/max range\n")
+cat("====================================\n")
+```

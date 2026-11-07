@@ -1,0 +1,312 @@
+---
+title: "Figure 1 - Observed Weighted Life-Satisfaction Trajectories"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(here)
+```
+
+```{r figure1}
+# -------------------------------------------------------------------------
+# FIGURE 1
+# Observed life-satisfaction trajectories in parent and
+# entropy-balanced non-parenting couples
+#
+# Primary ATT analysis:
+#   Parents       n = 709 couples, weight = 1
+#   Non-parenting n = 893 couples, entropy-balanced ATT weights
+#
+# Outcomes themselves are NOT imputed.
+# Only the entropy weights vary across the 20 imputations.
+# -------------------------------------------------------------------------
+
+# Paths
+PARENT_PATH <- here(
+  "data", "derived", "parent.rds"
+)
+
+CONTROL_PATH <- here(
+  "data", "derived", "childless.rds"
+)
+
+WEIGHTS_PATH <- here(
+  "data", "derived", "ebal_att_datasets.rds"
+)
+
+FIGURE_DIR <- here("figures")
+
+dir.create(
+  FIGURE_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  file.exists(PARENT_PATH),
+  file.exists(CONTROL_PATH),
+  file.exists(WEIGHTS_PATH)
+)
+
+# -------------------------------------------------------------------------
+# 1. Load observed longitudinal outcomes
+# -------------------------------------------------------------------------
+
+parent_long <- readRDS(PARENT_PATH)
+control_long <- readRDS(CONTROL_PATH)
+weight_list <- readRDS(WEIGHTS_PATH)
+
+stopifnot(length(weight_list) == 20L)
+
+# Same observed outcome grid used in 09_prepare_mplus_weighted_outcomes.Rmd
+outcome_long <- bind_rows(
+  parent_long %>%
+    mutate(group = 1L),
+  control_long %>%
+    mutate(group = 0L)
+) %>%
+  transmute(
+    couple_id = as.character(couple_id),
+    group = as.integer(group),
+    pid = as.numeric(pid),
+    sex = as.numeric(sex),
+    signal = as.integer(signal),
+    life_sat = as.numeric(life_sat)
+  ) %>%
+  mutate(
+    # signal 0 = -3 years; signal 3 = event year; signal 7 = +4 years
+    year = signal - 3L,
+
+    sex_label = case_when(
+      sex == 2 ~ "A. Female partners",
+      sex == 1 ~ "B. Male partners",
+      TRUE ~ NA_character_
+    ),
+
+    group_label = case_when(
+      group == 1 ~ "Parent couples",
+      group == 0 ~ "Non-parenting couples",
+      TRUE ~ NA_character_
+    )
+  )
+
+stopifnot(
+  n_distinct(outcome_long$couple_id[outcome_long$group == 1]) == 709L,
+  n_distinct(outcome_long$couple_id[outcome_long$group == 0]) == 893L
+)
+
+# -------------------------------------------------------------------------
+# 2. Compute weighted observed means in each of the 20 imputations
+# -------------------------------------------------------------------------
+
+trajectory_by_imp <- map_dfr(
+  seq_along(weight_list),
+  function(i) {
+
+    w_i <- weight_list[[i]] %>%
+      transmute(
+        couple_id = as.character(couple_id),
+        weight = as.numeric(att_weight_ebal)
+      )
+
+    stopifnot(
+      nrow(w_i) == 1602L,
+      n_distinct(w_i$couple_id) == 1602L,
+      all(is.finite(w_i$weight)),
+      all(w_i$weight > 0)
+    )
+
+    outcome_long %>%
+      left_join(
+        w_i,
+        by = "couple_id"
+      ) %>%
+      group_by(
+        group,
+        group_label,
+        sex,
+        sex_label,
+        signal,
+        year
+      ) %>%
+      summarise(
+        mean_ls = weighted.mean(
+          life_sat,
+          w = weight,
+          na.rm = TRUE
+        ),
+        n_observed = sum(!is.na(life_sat)),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        .imp = i,
+        .before = 1
+      )
+  }
+)
+
+# -------------------------------------------------------------------------
+# 3. Average the weighted means across the 20 imputed weight sets
+# -------------------------------------------------------------------------
+
+trajectory_means <- trajectory_by_imp %>%
+  group_by(
+    group,
+    group_label,
+    sex,
+    sex_label,
+    signal,
+    year
+  ) %>%
+  summarise(
+    # BUG FIX: compute min/max BEFORE the overwrite of mean_ls.
+    # dplyr::summarise evaluates left-to-right, so the old code
+    # (mean_ls first, then min/max) made both diagnostics equal
+    # to the already-computed scalar mean.
+    min_mean = min(mean_ls),
+    max_mean = max(mean_ls),
+    mean_ls = mean(mean_ls),
+    n_observed = first(n_observed),
+
+    .groups = "drop"
+  ) %>%
+  arrange(
+    sex,
+    group,
+    year
+  )
+
+print(
+  trajectory_means,
+  n = Inf
+)
+
+# -------------------------------------------------------------------------
+# 4. Publication figure
+# -------------------------------------------------------------------------
+
+p_fig1 <- ggplot(
+  trajectory_means,
+  aes(
+    x = year,
+    y = mean_ls,
+    colour = group_label,
+    linetype = group_label,
+    group = group_label
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.55,
+    colour = "grey50"
+  ) +
+  geom_line(
+    linewidth = 1
+  ) +
+  geom_point(
+    size = 2.4
+  ) +
+  facet_wrap(
+    ~ sex_label,
+    nrow = 1
+  ) +
+  scale_x_continuous(
+    breaks = -3:4,
+    labels = c(
+      "−3", "−2", "−1", "0",
+      "+1", "+2", "+3", "+4"
+    )
+  ) +
+  scale_y_continuous(
+    breaks = seq(7.0, 8.0, by = 0.25),
+    labels = scales::number_format(accuracy = 0.01)
+  ) +
+  coord_cartesian(
+    ylim = c(7.0, 8.0)
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Parent couples" = "#0072B2",
+      "Non-parenting couples" = "#D55E00"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Parent couples" = "solid",
+      "Non-parenting couples" = "dashed"
+    )
+  ) +
+  labs(
+    x = "Years relative to childbirth / pseudo-event",
+    y = "Life satisfaction",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_classic(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "top",
+    legend.justification = "center",
+
+    strip.background = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    ),
+
+    axis.title = element_text(
+      face = "bold"
+    ),
+
+    axis.text = element_text(
+      colour = "black"
+    ),
+
+    panel.spacing = unit(
+      1.3,
+      "lines"
+    ),
+
+    plot.margin = margin(
+      10, 15, 10, 10
+    )
+  )
+
+print(p_fig1)
+
+# -------------------------------------------------------------------------
+# 5. Save
+# -------------------------------------------------------------------------
+
+ggsave(
+  filename = here(
+    "figures",
+    "Figure1_observed_weighted_trajectories.pdf"
+  ),
+  plot = p_fig1,
+  width = 7.5,
+  height = 4.5,
+  units = "in",
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = here(
+    "figures",
+    "Figure1_observed_weighted_trajectories.png"
+  ),
+  plot = p_fig1,
+  width = 7.5,
+  height = 4.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```

@@ -1,0 +1,243 @@
+---
+title: "04_reshape_couple_wide"
+output: html_document
+---
+
+## Overview
+
+Reshapes the person-level IPW baseline data (`ipw_sample.rds`, produced by
+script 03) into a **one-row-per-couple wide format** (`ipw_wide.rds`) required
+by the MICE imputation in script 05.
+
+**Input:** `data/derived/ipw_sample.rds` — person-level baseline covariates
+(two rows per couple: one male, one female).
+
+**Outputs** (to `data/derived/`):
+
+- `ipw_wide.rds` — one row per couple with male-prefixed (`M_`) and
+  female-prefixed (`F_`) individual covariates plus shared household
+  covariates. Read by script 05 (`05_mice_imputation_clean.Rmd`).
+- `couple_key.csv` — crosswalk between the string `couple_id` and a numeric
+  `couple_id_num` used in downstream Mplus export.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load}
+library(tidyverse)
+library(haven)
+library(here)
+
+options(scipen = 999)
+
+# zap_labels drops any haven_labelled attributes that rode along from the raw
+# SOEP files through 03's joins; otherwise replace_na() downstream errors
+# trying to coerce a labelled column.
+ipw_sample <- readRDS(here("data", "derived", "ipw_sample.rds")) %>%
+  zap_labels()
+
+individual_vars <- c(
+  "age", "life_sat", "germborn", "migration", "germcitz",
+  "employment", "edu_level"
+)
+
+household_vars <- c(
+  "hinc", "hgowner", "size", "smallspace", "livedhere",
+  "east", "hhgr", "rel_duration", "syear"
+)
+```
+
+## Verify shared household/couple covariates
+
+```{r shared-check}
+# These variables are later taken from one partner's baseline row only.
+# Before doing so, verify that male and female values are identical within
+# every couple, including their missingness pattern.
+
+shared_check <- ipw_sample %>%
+  select(
+    couple_id,
+    sex,
+    all_of(household_vars)
+  ) %>%
+  pivot_wider(
+    names_from = sex,
+    values_from = all_of(household_vars),
+    names_glue = "{.value}_sex{sex}"
+  )
+
+stopifnot(
+  nrow(shared_check) == n_distinct(ipw_sample$couple_id)
+)
+
+shared_mismatch <- purrr::map_dfr(
+  household_vars,
+  function(v) {
+
+    male_value   <- shared_check[[paste0(v, "_sex1")]]
+    female_value <- shared_check[[paste0(v, "_sex2")]]
+
+    mismatch <- (
+      xor(is.na(male_value), is.na(female_value))
+    ) | (
+      !is.na(male_value) &
+        !is.na(female_value) &
+        abs(male_value - female_value) > 1e-8
+    )
+
+    tibble(
+      variable = v,
+      n_mismatch = sum(mismatch),
+      pct_mismatch = 100 * mean(mismatch)
+    )
+  }
+)
+
+cat("\n--- SHARED HOUSEHOLD/COUPLE VARIABLE CHECK ---\n")
+print(shared_mismatch)
+
+if (any(shared_mismatch$n_mismatch > 0)) {
+
+  bad_variables <- shared_mismatch %>%
+    filter(n_mismatch > 0) %>%
+    pull(variable)
+
+  stop(
+    "Male and female baseline rows disagree on shared variables: ",
+    paste(bad_variables, collapse = ", ")
+  )
+}
+
+cat("All shared household/couple covariates are identical within couples.\n")
+```
+
+## Reshape to one row per couple
+
+```{r reshape-wide}
+male_data <- ipw_sample %>%
+  filter(sex == 1) %>%
+  select(couple_id, all_of(individual_vars)) %>%
+  rename_with(~ paste0("M_", .), all_of(individual_vars))
+
+female_data <- ipw_sample %>%
+  filter(sex == 2) %>%
+  select(couple_id, all_of(individual_vars)) %>%
+  rename_with(~ paste0("F_", .), all_of(individual_vars))
+
+# Household/couple covariates are shared within dyad at baseline, so one
+# partner's row is sufficient after the baseline HID consistency check in 03.
+couple_data <- ipw_sample %>%
+  filter(sex == 1) %>%
+  select(couple_id, group, all_of(household_vars))
+
+ipw_wide <- couple_data %>%
+  inner_join(male_data,   by = "couple_id") %>%
+  inner_join(female_data, by = "couple_id")
+
+# One row per couple is assumed everywhere downstream.
+stopifnot(!anyDuplicated(ipw_wide$couple_id))
+
+# Lock the sample counts inherited from the final 03 build.
+stopifnot(
+  nrow(ipw_wide) == 1602,
+  sum(ipw_wide$group == 1) == 709,
+  sum(ipw_wide$group == 0) == 893
+)
+
+cat("Rows:", nrow(ipw_wide), " Columns:", ncol(ipw_wide), "\n")
+cat("Parent couples:",        sum(ipw_wide$group == 1), "\n")
+cat("Non-parenting couples:", sum(ipw_wide$group == 0), "\n")
+```
+
+## Diagnostics
+
+```{r diagnostics}
+cat("M_germcitz:\n")
+print(table(ipw_wide$M_germcitz, useNA = "always"))
+
+cat("F_germcitz:\n")
+print(table(ipw_wide$F_germcitz, useNA = "always"))
+
+cat("M_germborn:\n")
+print(table(ipw_wide$M_germborn, useNA = "always"))
+
+cat("hgowner:\n")
+print(table(ipw_wide$hgowner, useNA = "always"))
+
+cat("smallspace:\n")
+print(table(ipw_wide$smallspace, useNA = "always"))
+
+cat("east:\n")
+print(table(ipw_wide$east, useNA = "always"))
+
+cat("\nMissingness before exclusion:\n")
+
+ipw_wide %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "var",
+    values_to = "n_missing"
+  ) %>%
+  arrange(desc(n_missing)) %>%
+  print(n = 40)
+
+cat("\nCitizenship missingness in wide file:\n")
+cit_missing <- colSums(
+  is.na(ipw_wide[, c("M_germcitz", "F_germcitz")])
+)
+print(cit_missing)
+
+stopifnot(
+  cit_missing[["M_germcitz"]] == 0,
+  cit_missing[["F_germcitz"]] == 0
+)
+
+cat("\nCouples (no exclusion):", nrow(ipw_wide), "\n")
+cat("  Parent couples:",        sum(ipw_wide$group == 1), "\n")
+cat("  Non-parenting couples:", sum(ipw_wide$group == 0), "\n")
+```
+
+## Save couple-level data and ID crosswalk
+
+```{r save}
+# Build the couple_id <-> numeric ID crosswalk exactly once here.
+# Downstream files must reuse this mapping rather than recreating numeric IDs.
+couple_key <- ipw_wide %>%
+  distinct(couple_id) %>%
+  mutate(couple_id_num = as.integer(factor(couple_id)))
+
+stopifnot(
+  nrow(couple_key) == nrow(ipw_wide),
+  !anyDuplicated(couple_key$couple_id_num)
+)
+
+dir.create(
+  here("data", "derived"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+saveRDS(
+  ipw_wide,
+  here("data", "derived", "ipw_wide.rds")
+)
+
+write.csv(
+  couple_key,
+  here("data", "derived", "couple_key.csv"),
+  row.names = FALSE
+)
+
+cat(
+  "Saved data/derived/ipw_wide.rds —",
+  nrow(ipw_wide), "couples,",
+  ncol(ipw_wide), "columns\n"
+)
+
+cat(
+  "Saved data/derived/couple_key.csv —",
+  nrow(couple_key), "couple IDs\n"
+)
+```

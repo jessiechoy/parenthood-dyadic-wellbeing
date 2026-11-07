@@ -1,0 +1,545 @@
+---
+title: "06 MICE Diagnostics"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+library(mice)
+
+options(scipen = 999)
+
+# Final diagnostics for the production MICE run.
+# This script does not rerun or alter imputations.
+
+IMP_PATH <- here("data", "derived", "mice_imp_final.rds")
+INPUT_PATH <- here("data", "derived", "mice_input_final.rds")
+
+stopifnot(
+  file.exists(IMP_PATH),
+  file.exists(INPUT_PATH)
+)
+
+imp <- readRDS(IMP_PATH)
+dat <- readRDS(INPUT_PATH)
+
+cat("Loaded final MICE object.\n")
+cat("Rows:", nrow(dat), "\n")
+cat("Imputations:", imp$m, "\n")
+cat("Iterations:", imp$iteration, "\n")
+```
+
+## 1. Basic integrity
+
+```{r}
+expected_n <- 1602L
+expected_m <- 20L
+expected_iterations <- 20L
+
+stopifnot(
+  inherits(imp, "mids"),
+  nrow(dat) == expected_n,
+  imp$m == expected_m,
+  imp$iteration == expected_iterations,
+  identical(names(dat), names(imp$data))
+)
+
+if (is.null(imp$loggedEvents)) {
+  cat("Logged events: 0\n")
+} else {
+  cat("Logged events:", nrow(imp$loggedEvents), "\n")
+  print(imp$loggedEvents)
+}
+```
+
+## 2. Confirm missingness and imputation counts
+
+```{r}
+target_vars <- c(
+  "hinc",
+  "hgowner",
+  "smallspace",
+  "livedhere",
+  "east",
+  "M_edu_level",
+  "F_edu_level"
+)
+
+count_check <- tibble(
+  variable = target_vars,
+  n_missing_original = map_int(
+    target_vars,
+    ~ sum(is.na(dat[[.x]]))
+  ),
+  n_imputed_per_dataset = map_int(
+    target_vars,
+    ~ nrow(imp$imp[[.x]])
+  )
+) %>%
+  mutate(
+    matches = n_missing_original == n_imputed_per_dataset
+  )
+
+print(count_check)
+
+stopifnot(all(count_check$matches))
+```
+
+## 3. Completed datasets: no remaining missingness
+
+```{r}
+completed_list <- complete(
+  imp,
+  action = "all"
+)
+
+remaining_missing <- map_dfr(
+  seq_along(completed_list),
+  function(i) {
+    tibble(
+      imp = i,
+      variable = names(completed_list[[i]]),
+      n_missing = map_int(
+        completed_list[[i]],
+        ~ sum(is.na(.x))
+      )
+    )
+  }
+) %>%
+  filter(n_missing > 0)
+
+print(remaining_missing)
+
+stopifnot(nrow(remaining_missing) == 0)
+```
+
+## 4. Convergence / chain mixing
+
+```{r fig.width=11, fig.height=9}
+plot(
+  imp,
+  c(
+    "hinc",
+    "livedhere",
+    "hgowner",
+    "smallspace",
+    "east",
+    "M_edu_level",
+    "F_edu_level"
+  )
+)
+```
+
+Look for overlapping chains fluctuating around stable levels without sustained trends.
+
+## 5. Build observed-versus-imputed diagnostic data
+
+```{r}
+make_imp_values <- function(var) {
+
+  missing_rows <- which(is.na(dat[[var]]))
+
+  map_dfr(
+    seq_len(imp$m),
+    function(i) {
+
+      completed_i <- completed_list[[i]]
+      raw_values <- completed_i[[var]][missing_rows]
+
+      tibble(
+        imp = i,
+        row_id = missing_rows,
+        value_chr = as.character(raw_values),
+        value_num = suppressWarnings(
+          as.numeric(as.character(raw_values))
+        )
+      )
+    }
+  ) %>%
+    mutate(
+      variable = var,
+      .before = 1
+    )
+}
+
+imputed_long <- map_dfr(
+  target_vars,
+  make_imp_values
+)
+
+stopifnot(
+  sum(is.na(imputed_long$value_num)) == 0
+)
+```
+
+## 6. PMM donor-support checks
+
+```{r}
+pmm_vars <- c("hinc", "livedhere")
+
+pmm_support <- map_dfr(
+  pmm_vars,
+  function(v) {
+
+    observed_values <- unique(
+      as.numeric(dat[[v]][!is.na(dat[[v]])])
+    )
+
+    imputed_values <- imputed_long %>%
+      filter(variable == v) %>%
+      pull(value_num)
+
+    tibble(
+      variable = v,
+      n_imputed = length(imputed_values),
+      n_not_in_observed_support =
+        sum(!(imputed_values %in% observed_values)),
+      min_imputed = min(imputed_values),
+      max_imputed = max(imputed_values)
+    )
+  }
+)
+
+print(pmm_support)
+
+stopifnot(
+  all(pmm_support$n_not_in_observed_support == 0)
+)
+```
+
+## 7. Continuous-variable observed vs imputed summaries
+
+```{r}
+continuous_vars <- c("hinc", "livedhere")
+
+continuous_summary <- map_dfr(
+  continuous_vars,
+  function(v) {
+
+    observed <- as.numeric(
+      dat[[v]][!is.na(dat[[v]])]
+    )
+
+    imputed <- imputed_long %>%
+      filter(variable == v) %>%
+      pull(value_num)
+
+    bind_rows(
+      tibble(
+        variable = v,
+        source = "Observed",
+        n = length(observed),
+        min = min(observed),
+        q1 = quantile(observed, .25),
+        median = median(observed),
+        mean = mean(observed),
+        q3 = quantile(observed, .75),
+        max = max(observed)
+      ),
+      tibble(
+        variable = v,
+        source = "Imputed",
+        n = length(imputed),
+        min = min(imputed),
+        q1 = quantile(imputed, .25),
+        median = median(imputed),
+        mean = mean(imputed),
+        q3 = quantile(imputed, .75),
+        max = max(imputed)
+      )
+    )
+  }
+)
+
+print(continuous_summary)
+```
+
+## 8. Distribution plots
+
+```{r fig.width=8, fig.height=5}
+densityplot(
+  imp,
+  ~ hinc
+)
+```
+
+```{r fig.width=8, fig.height=5}
+densityplot(
+  imp,
+  ~ livedhere
+)
+```
+
+## 9. PMM variation across imputations
+
+```{r}
+pmm_by_imp <- imputed_long %>%
+  filter(variable %in% pmm_vars) %>%
+  group_by(variable, imp) %>%
+  summarise(
+    n = n(),
+    min = min(value_num),
+    q1 = quantile(value_num, .25),
+    median = median(value_num),
+    mean = mean(value_num),
+    q3 = quantile(value_num, .75),
+    max = max(value_num),
+    .groups = "drop"
+  )
+
+print(pmm_by_imp)
+```
+
+## 10. `livedhere` support
+
+```{r}
+livedhere_imp <- imputed_long %>%
+  filter(variable == "livedhere")
+
+livedhere_support <- livedhere_imp %>%
+  summarise(
+    n = n(),
+    min = min(value_num),
+    max = max(value_num),
+    n_negative = sum(value_num < 0),
+    n_noninteger = sum(
+      abs(value_num - round(value_num)) > 1e-8
+    )
+  )
+
+print(livedhere_support)
+
+stopifnot(
+  livedhere_support$n_negative == 0,
+  livedhere_support$n_noninteger == 0
+)
+```
+
+## 11. Income support
+
+```{r}
+hinc_imp <- imputed_long %>%
+  filter(variable == "hinc")
+
+hinc_support <- hinc_imp %>%
+  summarise(
+    n = n(),
+    min = min(value_num),
+    max = max(value_num),
+    n_nonpositive = sum(value_num <= 0)
+  )
+
+print(hinc_support)
+
+stopifnot(
+  hinc_support$n_nonpositive == 0
+)
+```
+
+## 12. Binary-variable observed vs imputed proportions
+
+```{r}
+binary_vars <- c(
+  "hgowner",
+  "smallspace",
+  "east"
+)
+
+binary_summary <- map_dfr(
+  binary_vars,
+  function(v) {
+
+    observed_num <- as.numeric(
+      as.character(
+        dat[[v]][!is.na(dat[[v]])]
+      )
+    )
+
+    imputed_num <- imputed_long %>%
+      filter(variable == v) %>%
+      pull(value_num)
+
+    tibble(
+      variable = v,
+      source = c("Observed", "Imputed"),
+      n = c(length(observed_num), length(imputed_num)),
+      prop_1 = c(
+        mean(observed_num == 1),
+        mean(imputed_num == 1)
+      )
+    )
+  }
+)
+
+print(binary_summary)
+```
+
+## 13. Binary variation across imputations
+
+```{r}
+binary_by_imp <- imputed_long %>%
+  filter(variable %in% binary_vars) %>%
+  group_by(variable, imp) %>%
+  summarise(
+    prop_1 = mean(value_num == 1),
+    .groups = "drop"
+  )
+
+print(binary_by_imp)
+```
+
+## 14. Education observed vs imputed distributions
+
+```{r}
+edu_vars <- c(
+  "M_edu_level",
+  "F_edu_level"
+)
+
+edu_summary <- map_dfr(
+  edu_vars,
+  function(v) {
+
+    observed <- tibble(
+      value = as.character(
+        dat[[v]][!is.na(dat[[v]])]
+      ),
+      source = "Observed"
+    )
+
+    imputed <- imputed_long %>%
+      filter(variable == v) %>%
+      transmute(
+        value = value_chr,
+        source = "Imputed"
+      )
+
+    bind_rows(
+      observed,
+      imputed
+    ) %>%
+      count(source, value, name = "n") %>%
+      group_by(source) %>%
+      mutate(
+        proportion = n / sum(n)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        variable = v,
+        .before = 1
+      )
+  }
+)
+
+print(edu_summary)
+```
+
+## 15. Education variation across imputations
+
+```{r}
+edu_by_imp <- imputed_long %>%
+  filter(variable %in% edu_vars) %>%
+  count(
+    variable,
+    imp,
+    value_chr,
+    name = "n"
+  ) %>%
+  group_by(variable, imp) %>%
+  mutate(
+    proportion = n / sum(n)
+  ) %>%
+  ungroup()
+
+print(edu_by_imp)
+```
+
+## 16. Strip diagnostics
+
+```{r fig.width=9, fig.height=6}
+stripplot(
+  imp,
+  hinc ~ .imp,
+  pch = 20,
+  cex = 0.45
+)
+```
+
+```{r fig.width=9, fig.height=6}
+stripplot(
+  imp,
+  livedhere ~ .imp,
+  pch = 20,
+  cex = 0.45
+)
+```
+
+## 17. Final automatic checks
+
+```{r}
+n_logged <- if (
+  is.null(imp$loggedEvents)
+) {
+  0L
+} else {
+  nrow(imp$loggedEvents)
+}
+
+cat("\n====================================\n")
+cat("06 FINAL MICE DIAGNOSTIC SUMMARY\n")
+cat("====================================\n")
+cat("Logged events:", n_logged, "\n")
+cat(
+  "Unexpected PMM donor values:",
+  sum(pmm_support$n_not_in_observed_support),
+  "\n"
+)
+cat(
+  "Negative livedhere imputations:",
+  livedhere_support$n_negative,
+  "\n"
+)
+cat(
+  "Noninteger livedhere imputations:",
+  livedhere_support$n_noninteger,
+  "\n"
+)
+cat(
+  "Nonpositive income imputations:",
+  hinc_support$n_nonpositive,
+  "\n"
+)
+cat(
+  "Remaining missing values:",
+  nrow(remaining_missing),
+  "\n"
+)
+cat("====================================\n")
+
+stopifnot(
+  n_logged == 0,
+  sum(pmm_support$n_not_in_observed_support) == 0,
+  livedhere_support$n_negative == 0,
+  livedhere_support$n_noninteger == 0,
+  hinc_support$n_nonpositive == 0,
+  nrow(remaining_missing) == 0
+)
+
+cat(
+  "\nPASS: all automatic integrity/support checks passed.\n",
+  "Review the final trace and distribution plots before proceeding ",
+  "to propensity-score estimation.\n"
+)
+```
